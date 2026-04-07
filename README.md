@@ -18,7 +18,6 @@
     <a href="#configuration">Config</a>
   </p>
   <p align="center">
-    <img src="https://img.shields.io/github/license/lightcap-ai/mcp-nexus?style=flat-square" alt="License"/>
   </p>
 </p>
 
