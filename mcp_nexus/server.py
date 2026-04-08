@@ -20,6 +20,7 @@ from mcp_nexus.auth.oauth import GatewayOAuthProvider
 from mcp_nexus.config import Settings
 from mcp_nexus.gateway import GatewayManager
 from mcp_nexus.intelligence.memory import MemoryEngine
+from mcp_nexus.landing import render_mcp_entry_page
 from mcp_nexus.middleware.audit import AuditEntry, AuditLog
 from mcp_nexus.middleware.rate_limit import RateLimiter
 from mcp_nexus.registry import ToolRegistry, apply_registry_metadata, build_tool_registry
@@ -496,6 +497,13 @@ def _resolve_mcp_path(path: str, settings: Settings) -> str:
     return path
 
 
+def _is_browser_html_request(method: str, accept_header: str) -> bool:
+    if method.upper() != "GET":
+        return False
+    accept = accept_header.lower()
+    return "text/html" in accept and "application/json" not in accept
+
+
 class NexusRequestContextMiddleware:
     """Inject request/session metadata and typed transport errors."""
 
@@ -520,6 +528,13 @@ class NexusRequestContextMiddleware:
             resolved_scope = dict(scope)
             resolved_scope["path"] = path
             resolved_scope["raw_path"] = path.encode()
+        if _is_mcp_request(path, self.settings) and _is_browser_html_request(
+            scope.get("method", "GET"),
+            headers.get("accept", ""),
+        ):
+            response = render_mcp_entry_page(self.settings)
+            await response(scope, receive, send)
+            return
         request_id = headers.get("x-request-id") or uuid4().hex
         trace_id = headers.get("x-trace-id") or request_id
         session_id = headers.get("mcp-session-id")

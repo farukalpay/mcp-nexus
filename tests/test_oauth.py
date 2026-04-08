@@ -55,6 +55,20 @@ def test_mcp_requires_auth_and_exposes_metadata():
         assert payload["registration_endpoint"] == "https://example.com/register"
 
 
+def test_mcp_browser_get_renders_connect_landing_without_breaking_auth_surface():
+    app = create_app(_oauth_settings(), enable_watchdog=False)
+
+    with TestClient(app) as client:
+        landing = client.get("/mcp/nexus", headers={"Accept": "text/html"})
+        assert landing.status_code == 200
+        assert "Connect your AI to a real server." in landing.text
+        assert "View On GitHub" in landing.text
+        assert "Manual OAuth Values" in landing.text
+
+        api_like = client.get("/mcp/nexus", headers={"Accept": "application/json"})
+        assert api_like.status_code == 401
+
+
 def test_oauth_authorization_code_flow_completes_against_consent_route():
     app = create_app(_oauth_settings(), enable_watchdog=False)
     verifier, challenge = _pkce_pair("codex-test-verifier")

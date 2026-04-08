@@ -12,6 +12,7 @@ TOOL_CATEGORIES: dict[str, tuple[str, ...]] = {
         "list_directory",
         "search_files",
         "search_content",
+        "compare_paths",
         "file_info",
         "move_file",
         "delete_file",
@@ -29,6 +30,7 @@ TOOL_CATEGORIES: dict[str, tuple[str, ...]] = {
     "terminal": (
         "execute_command",
         "execute_script",
+        "execute_batch",
         "execute_python",
         "environment_info",
         "which_command",
@@ -39,6 +41,7 @@ TOOL_CATEGORIES: dict[str, tuple[str, ...]] = {
     ),
     "git": (
         "git_status",
+        "git_diagnose",
         "git_diff",
         "git_log",
         "git_commit",

@@ -10,14 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# App code
+# Package metadata + app code
+COPY README.md LICENSE pyproject.toml ./
 COPY mcp_nexus/ mcp_nexus/
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir .
 
 # Non-root user
 RUN useradd -m nexus

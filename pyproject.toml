@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-nexus"
-version = "1.2.0"
+dynamic = ["version"]
 description = "Remote server management through MCP with built-in intelligence — the AI learns how you work."
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.10"
 authors = [
     {name = "Lightcap AI", email = "dev@lightcap.ai"},
@@ -16,7 +16,6 @@ keywords = ["mcp", "model-context-protocol", "remote-server", "ssh", "devops", "
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -42,18 +41,24 @@ dev = [
     "ruff>=0.5.0",
     "mypy>=1.10",
 ]
+fastapi = [
+    "fastapi>=0.115.0",
+]
 
 [project.urls]
 Homepage = "https://lightcap.ai"
-Repository = "https://github.com/lightcap-ai/mcp-nexus"
-Documentation = "https://github.com/lightcap-ai/mcp-nexus#readme"
-Issues = "https://github.com/lightcap-ai/mcp-nexus/issues"
+Repository = "https://github.com/farukalpay/mcp-nexus"
+Documentation = "https://github.com/farukalpay/mcp-nexus#readme"
+Issues = "https://github.com/farukalpay/mcp-nexus/issues"
 
 [project.scripts]
 mcp-nexus = "mcp_nexus.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["mcp_nexus*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mcp_nexus.__version__"}
 
 [tool.ruff]
 target-version = "py311"

@@ -3,11 +3,240 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
+import time
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from mcp_nexus.server import get_pool
+from mcp_nexus.results import ToolResult, build_tool_result
+from mcp_nexus.server import get_artifacts, get_pool, get_settings, tool_context
+
+
+def _result(
+    tool_name: str,
+    *,
+    ok: bool,
+    duration_ms: float,
+    stdout_text: str = "",
+    stderr_text: str = "",
+    error_code: str | None = None,
+    error_stage: str | None = None,
+    message: str | None = None,
+    exit_code: int | None = None,
+    data: Any = None,
+    usage: dict[str, Any] | None = None,
+) -> ToolResult:
+    settings = get_settings()
+    return build_tool_result(
+        context=tool_context(tool_name),
+        artifacts=get_artifacts(),
+        ok=ok,
+        duration_ms=duration_ms,
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+        output_limit=settings.output_limit_bytes,
+        error_limit=settings.error_limit_bytes,
+        output_preview_limit=settings.output_preview_bytes,
+        error_preview_limit=settings.error_preview_bytes,
+        error_code=error_code,
+        error_stage=error_stage,
+        message=message,
+        exit_code=exit_code,
+        data=data,
+        resource_usage=usage,
+    )
+
+
+def _parse_tracking_counts(summary: str) -> tuple[int, int]:
+    ahead = 0
+    behind = 0
+    for match in re.finditer(r"(ahead|behind) (\d+)", summary):
+        kind, count = match.groups()
+        if kind == "ahead":
+            ahead = int(count)
+        else:
+            behind = int(count)
+    return ahead, behind
+
+
+def _parse_status_header(header: str) -> dict[str, Any]:
+    text = header.strip()
+    if text.startswith("HEAD"):
+        return {
+            "branch": None,
+            "upstream": None,
+            "ahead": 0,
+            "behind": 0,
+            "detached_head": True,
+            "raw": text,
+        }
+
+    summary = ""
+    if text.endswith("]") and " [" in text:
+        text, summary = text[:-1].split(" [", 1)
+
+    branch = text
+    upstream = None
+    if "..." in text:
+        branch, upstream = text.split("...", 1)
+    ahead, behind = _parse_tracking_counts(summary)
+    return {
+        "branch": branch or None,
+        "upstream": upstream or None,
+        "ahead": ahead,
+        "behind": behind,
+        "detached_head": False,
+        "raw": header,
+    }
+
+
+def _status_label(code: str) -> str:
+    if code == "??":
+        return "untracked"
+    if code == "!!":
+        return "ignored"
+    if "U" in code:
+        return "conflicted"
+    if code[0] == "R":
+        return "renamed"
+    if code[0] == "C":
+        return "copied"
+    if code[0] != " " and code[1] != " ":
+        return "staged_and_unstaged"
+    if code[0] != " ":
+        return "staged"
+    if code[1] != " ":
+        return "unstaged"
+    return "clean"
+
+
+def _parse_status_output(output: str, *, max_entries: int = 50) -> dict[str, Any]:
+    header: dict[str, Any] = {
+        "branch": None,
+        "upstream": None,
+        "ahead": 0,
+        "behind": 0,
+        "detached_head": False,
+        "raw": "",
+    }
+    entries: list[dict[str, Any]] = []
+    staged_count = 0
+    unstaged_count = 0
+    untracked_count = 0
+    ignored_count = 0
+    conflicted_count = 0
+    entry_count = 0
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        if line.startswith("## "):
+            header = _parse_status_header(line[3:])
+            continue
+        if line.startswith("?? "):
+            untracked_count += 1
+            entry_count += 1
+            if len(entries) < max_entries:
+                entries.append({"status_code": "??", "status": "untracked", "path": line[3:]})
+            continue
+        if line.startswith("!! "):
+            ignored_count += 1
+            entry_count += 1
+            if len(entries) < max_entries:
+                entries.append({"status_code": "!!", "status": "ignored", "path": line[3:]})
+            continue
+        if len(line) < 3:
+            continue
+
+        status_code = line[:2]
+        path = line[3:]
+        entry_count += 1
+        label = _status_label(status_code)
+        staged = status_code[0] != " "
+        unstaged = status_code[1] != " "
+        conflicted = "U" in status_code
+        if staged:
+            staged_count += 1
+        if unstaged:
+            unstaged_count += 1
+        if conflicted:
+            conflicted_count += 1
+        entry: dict[str, Any] = {
+            "status_code": status_code,
+            "status": label,
+            "path": path,
+            "staged": staged,
+            "unstaged": unstaged,
+            "conflicted": conflicted,
+        }
+        if " -> " in path and status_code[0] in {"R", "C"}:
+            old_path, new_path = path.split(" -> ", 1)
+            entry["old_path"] = old_path
+            entry["new_path"] = new_path
+        if len(entries) < max_entries:
+            entries.append(entry)
+
+    total_count = entry_count
+    tracked_count = total_count - untracked_count - ignored_count
+    dirty = bool(staged_count or unstaged_count or untracked_count or conflicted_count)
+    return {
+        "header": header,
+        "entries": entries,
+        "counts": {
+            "staged": staged_count,
+            "unstaged": unstaged_count,
+            "untracked": untracked_count,
+            "ignored": ignored_count,
+            "conflicted": conflicted_count,
+            "tracked": tracked_count,
+            "total": total_count,
+        },
+        "dirty": dirty,
+        "truncated": entry_count > len(entries),
+    }
+
+
+def _parse_worktree_output(output: str, *, max_entries: int = 20) -> list[dict[str, Any]]:
+    worktrees: list[dict[str, Any]] = []
+    current: dict[str, Any] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current:
+                worktrees.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current["path"] = value.strip()
+        elif key == "HEAD":
+            current["head"] = value.strip()
+        elif key == "branch":
+            current["branch"] = value.strip()
+        elif key == "bare":
+            current["bare"] = True
+    if current:
+        worktrees.append(current)
+    return worktrees[:max_entries]
+
+
+def _parse_stash_output(output: str, *, max_entries: int = 20) -> list[dict[str, Any]]:
+    stashes: list[dict[str, Any]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split("\t", 2)
+        entry = {"ref": parts[0]}
+        if len(parts) > 1:
+            entry["age"] = parts[1]
+        if len(parts) > 2:
+            entry["message"] = parts[2]
+        stashes.append(entry)
+    return stashes[:max_entries]
 
 
 def _git(sub: str, cwd: str) -> str:
@@ -30,6 +259,216 @@ def register(mcp: FastMCP):
                     "branch": branch.stdout.strip() if branch.ok else "unknown",
                     "status": result.strip(),
                 }
+            )
+        finally:
+            pool.release(conn)
+
+    @mcp.tool(structured_output=True)
+    async def git_diagnose(repo_path: str = ".", include_diff: bool = False, max_entries: int = 50) -> ToolResult:
+        """Summarize repository health, branch state, worktrees, stashes, and conflicts."""
+        started = time.monotonic()
+        pool = get_pool()
+        conn = await pool.acquire()
+        warnings: list[str] = []
+        try:
+            git_check = await conn.run_full("which git 2>/dev/null", timeout=5)
+            if not git_check.ok:
+                return _result(
+                    "git_diagnose",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    error_code="GIT_UNAVAILABLE",
+                    error_stage="capability_probe",
+                    message="git is not installed on the target host.",
+                    data={"repo_path": repo_path},
+                )
+
+            root_result = await conn.run_full(_git("rev-parse --show-toplevel", repo_path), timeout=10)
+            if not root_result.ok:
+                return _result(
+                    "git_diagnose",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    stdout_text=root_result.stdout,
+                    stderr_text=root_result.stderr,
+                    error_code="NOT_A_GIT_REPOSITORY",
+                    error_stage="inspection",
+                    message="Path is not inside a git repository.",
+                    data={"repo_path": repo_path},
+                )
+
+            head_result = await conn.run_full(_git("rev-parse --short HEAD", repo_path), timeout=10)
+            status_result = await conn.run_full(
+                _git("status --porcelain=v1 -b --untracked-files=all", repo_path),
+                timeout=20,
+            )
+            if not status_result.ok:
+                return _result(
+                    "git_diagnose",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    stdout_text=status_result.stdout,
+                    stderr_text=status_result.stderr,
+                    error_code="GIT_STATUS_FAILED",
+                    error_stage="inspection",
+                    message="Failed to inspect repository status.",
+                    data={"repo_path": repo_path, "root": root_result.stdout.strip()},
+                )
+
+            status = _parse_status_output(status_result.stdout, max_entries=max_entries)
+
+            worktree_result = await conn.run_full(_git("worktree list --porcelain", repo_path), timeout=20)
+            if worktree_result.ok:
+                worktrees = _parse_worktree_output(worktree_result.stdout, max_entries=max_entries)
+            else:
+                worktrees = []
+                warnings.append(worktree_result.stderr.strip() or "worktree inspection unavailable")
+
+            stash_result = await conn.run_full(_git("stash list --format=%gd\t%cr\t%s", repo_path), timeout=15)
+            if stash_result.ok:
+                stashes = _parse_stash_output(stash_result.stdout, max_entries=max_entries)
+            else:
+                stashes = []
+                warnings.append(stash_result.stderr.strip() or "stash inspection unavailable")
+
+            markers_cmd = "\n".join(
+                [
+                    "for marker in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do",
+                    '  path=$(git rev-parse --git-path "$marker")',
+                    '  if [ -e "$path" ]; then',
+                    '    printf "%s=1\\n" "$marker"',
+                    "  else",
+                    '    printf "%s=0\\n" "$marker"',
+                    "  fi",
+                    "done",
+                ]
+            )
+            markers_result = await conn.run_full(f"cd {shlex.quote(repo_path)} && {markers_cmd}", timeout=20)
+            markers: dict[str, bool] = {}
+            if markers_result.ok:
+                for raw_line in markers_result.stdout.splitlines():
+                    if "=" not in raw_line:
+                        continue
+                    key, value = raw_line.split("=", 1)
+                    markers[key] = value.strip() == "1"
+            else:
+                warnings.append(markers_result.stderr.strip() or "state marker inspection unavailable")
+
+            staged_diff = ""
+            unstaged_diff = ""
+            if include_diff:
+                staged_result = await conn.run_full(
+                    _git("diff --cached --stat --summary --no-ext-diff", repo_path),
+                    timeout=30,
+                )
+                if staged_result.exit_code in {0, 1}:
+                    staged_diff = staged_result.stdout.strip()
+                else:
+                    warnings.append(staged_result.stderr.strip() or "staged diff stat unavailable")
+
+                unstaged_result = await conn.run_full(
+                    _git("diff --stat --summary --no-ext-diff", repo_path),
+                    timeout=30,
+                )
+                if unstaged_result.exit_code in {0, 1}:
+                    unstaged_diff = unstaged_result.stdout.strip()
+                else:
+                    warnings.append(unstaged_result.stderr.strip() or "unstaged diff stat unavailable")
+
+            header = status["header"]
+            branch = header.get("branch")
+            upstream = header.get("upstream")
+            ahead = header.get("ahead", 0)
+            behind = header.get("behind", 0)
+            detached_head = bool(header.get("detached_head"))
+            counts = status["counts"]
+            dirty = bool(status["dirty"])
+            conflicted = counts["conflicted"] > 0
+            if conflicted:
+                overall_state = "conflicted"
+            elif dirty:
+                overall_state = "dirty"
+            else:
+                overall_state = "clean"
+            if detached_head:
+                overall_state = f"detached-{overall_state}"
+
+            summary_lines = [
+                f"repo: {root_result.stdout.strip()}",
+                f"head: {head_result.stdout.strip() if head_result.ok else 'unknown'}",
+                f"branch: {branch or '(detached)'}",
+            ]
+            if upstream:
+                summary_lines.append(f"upstream: {upstream} (+{ahead} / -{behind})")
+            summary_lines.extend(
+                [
+                    (
+                        "state: "
+                        f"{overall_state} "
+                        f"(tracked {counts['tracked']}, staged flags {counts['staged']}, "
+                        f"unstaged flags {counts['unstaged']}, untracked {counts['untracked']}, "
+                        f"conflicted {counts['conflicted']})"
+                    ),
+                    f"worktrees: {len(worktrees)}",
+                    f"stashes: {len(stashes)}",
+                ]
+            )
+            if warnings:
+                summary_lines.append("warnings:")
+                summary_lines.extend(f"- {warning}" for warning in warnings)
+            if include_diff:
+                if staged_diff:
+                    summary_lines.extend(["staged diff stat:", staged_diff])
+                if unstaged_diff:
+                    summary_lines.extend(["unstaged diff stat:", unstaged_diff])
+
+            if conflicted:
+                message = "Repository has unresolved conflicts."
+            elif detached_head and dirty:
+                message = "Repository is detached and has pending changes."
+            elif detached_head and not dirty:
+                message = "Repository is detached but clean."
+            elif dirty:
+                message = "Repository has pending changes."
+            else:
+                message = "Repository is clean."
+            if warnings:
+                message = f"{message} Partial diagnostic data was unavailable."
+
+            return _result(
+                "git_diagnose",
+                ok=True,
+                duration_ms=(time.monotonic() - started) * 1000,
+                stdout_text="\n".join(summary_lines),
+                message=message,
+                data={
+                    "repo_path": repo_path,
+                    "root": root_result.stdout.strip(),
+                    "head": head_result.stdout.strip() if head_result.ok else None,
+                    "max_entries": max_entries,
+                    "branch": branch,
+                    "upstream": upstream,
+                    "ahead": ahead,
+                    "behind": behind,
+                    "detached_head": detached_head,
+                    "overall_state": overall_state,
+                    "dirty": dirty,
+                    "conflicted": conflicted,
+                    "counts": counts,
+                    "status_preview": status["entries"],
+                    "status_truncated": status["truncated"],
+                    "worktrees": worktrees,
+                    "stashes": stashes,
+                    "markers": markers,
+                    "include_diff": include_diff,
+                    "diff_stat": {
+                        "staged": staged_diff or None,
+                        "unstaged": unstaged_diff or None,
+                    }
+                    if include_diff
+                    else None,
+                    "warnings": warnings,
+                },
             )
         finally:
             pool.release(conn)

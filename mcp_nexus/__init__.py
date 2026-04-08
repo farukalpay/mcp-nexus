@@ -3,6 +3,11 @@
 __version__ = "1.2.0"
 __author__ = "Lightcap AI"
 
-from mcp_nexus.server import create_server
-
 __all__ = ["create_server", "__version__"]
+
+
+def create_server(*args, **kwargs):
+    """Lazily import the server factory to keep package metadata imports lightweight."""
+    from mcp_nexus.server import create_server as _create_server
+
+    return _create_server(*args, **kwargs)

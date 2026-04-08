@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import shlex
 import time
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from mcp_nexus.results import ToolResult, build_tool_result
+from mcp_nexus.results import ToolResult, build_tool_result, preview_text
 from mcp_nexus.runtime import ExecutionLimits, ExecutionRequest, build_managed_command, extract_execution_metadata
 from mcp_nexus.server import get_artifacts, get_pool, get_settings, tool_context
 from mcp_nexus.transport.ssh import CommandResult
@@ -41,6 +42,75 @@ def _error_code_for_result(result: CommandResult) -> tuple[str | None, str | Non
     return "COMMAND_FAILED", "execution"
 
 
+@dataclass(frozen=True)
+class BatchCommandResult:
+    index: int
+    command: str
+    ok: bool
+    exit_code: int | None
+    duration_ms: float
+    error_code: str | None
+    error_stage: str | None
+    stdout_preview: str
+    stderr_preview: str
+    usage: dict[str, Any] | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "command": self.command,
+            "ok": self.ok,
+            "exit_code": self.exit_code,
+            "duration_ms": round(self.duration_ms, 2),
+            "error_code": self.error_code,
+            "error_stage": self.error_stage,
+            "stdout_preview": self.stdout_preview,
+            "stderr_preview": self.stderr_preview,
+            "usage": self.usage,
+        }
+
+
+async def _run_execution_on_connection(
+    conn,
+    *,
+    capabilities,
+    command: str,
+    cwd: str = "",
+    timeout: int = 60,
+    env: dict[str, str] | None = None,
+    capture_usage: bool = True,
+    cpu_limit_sec: int = 0,
+    memory_limit_mb: int = 0,
+    file_size_limit_mb: int = 0,
+    process_limit: int = 0,
+) -> tuple[CommandResult, dict[str, Any] | None, dict[str, Any], float]:
+    request = ExecutionRequest(
+        command=command,
+        cwd=_safe_cwd(cwd),
+        timeout=timeout,
+        env=env or {},
+        capture_usage=capture_usage,
+        limits=ExecutionLimits(
+            cpu_seconds=max(0, cpu_limit_sec),
+            memory_mb=max(0, memory_limit_mb),
+            file_size_mb=max(0, file_size_limit_mb),
+            process_count=max(0, process_limit),
+        ),
+    )
+    start = time.monotonic()
+    result = await conn.run_full(build_managed_command(capabilities, request), timeout=timeout)
+    duration_ms = (time.monotonic() - start) * 1000
+    stderr, usage = extract_execution_metadata(result.stderr)
+    normalized = CommandResult(stdout=result.stdout, stderr=stderr, exit_code=result.exit_code)
+    capability_data = {
+        "system": capabilities.system,
+        "python_command": capabilities.python_command,
+        "package_manager": capabilities.package_manager,
+        "service_manager": capabilities.service_manager,
+    }
+    return normalized, usage, capability_data, duration_ms
+
+
 async def _run_execution(
     *,
     command: str,
@@ -59,33 +129,37 @@ async def _run_execution(
     conn = await pool.acquire()
     try:
         capabilities = await conn.probe_capabilities()
-        request = ExecutionRequest(
+        return await _run_execution_on_connection(
+            conn,
+            capabilities=capabilities,
             command=command,
-            cwd=_safe_cwd(cwd),
+            cwd=cwd,
             timeout=timeout,
-            env=env or {},
+            env=env,
             capture_usage=capture_usage,
-            limits=ExecutionLimits(
-                cpu_seconds=max(0, cpu_limit_sec),
-                memory_mb=max(0, memory_limit_mb),
-                file_size_mb=max(0, file_size_limit_mb),
-                process_count=max(0, process_limit),
-            ),
+            cpu_limit_sec=cpu_limit_sec,
+            memory_limit_mb=memory_limit_mb,
+            file_size_limit_mb=file_size_limit_mb,
+            process_limit=process_limit,
         )
-        start = time.monotonic()
-        result = await conn.run_full(build_managed_command(capabilities, request), timeout=timeout)
-        duration_ms = (time.monotonic() - start) * 1000
-        stderr, usage = extract_execution_metadata(result.stderr)
-        normalized = CommandResult(stdout=result.stdout, stderr=stderr, exit_code=result.exit_code)
-        capability_data = {
-            "system": capabilities.system,
-            "python_command": capabilities.python_command,
-            "package_manager": capabilities.package_manager,
-            "service_manager": capabilities.service_manager,
-        }
-        return normalized, usage, capability_data, duration_ms
     finally:
         pool.release(conn)
+
+
+def _aggregate_batch_usage(results: list[BatchCommandResult]) -> dict[str, Any] | None:
+    usages = [result.usage for result in results if result.usage]
+    if not usages:
+        return None
+
+    aggregate: dict[str, Any] = {
+        "command_count": len(results),
+        "usage_count": len(usages),
+        "wall_ms_total": round(sum(float(item.get("wall_ms", 0.0)) for item in usages), 2),
+        "user_cpu_s_total": round(sum(float(item.get("user_cpu_s", 0.0)) for item in usages), 4),
+        "system_cpu_s_total": round(sum(float(item.get("system_cpu_s", 0.0)) for item in usages), 4),
+        "max_rss_kb_peak": max(int(item.get("max_rss_kb", 0) or 0) for item in usages),
+    }
+    return aggregate
 
 
 def _result(
@@ -223,6 +297,240 @@ def register(mcp: FastMCP):
             exit_code=result.exit_code,
             data={"capabilities": capabilities, "cwd": _safe_cwd(cwd) or None},
             usage=usage,
+        )
+
+    @mcp.tool(structured_output=True)
+    async def execute_batch(
+        commands: list[str],
+        cwd: str = "",
+        timeout: int = 60,
+        env: dict[str, str] | None = None,
+        capture_usage: bool = True,
+        stop_on_error: bool = True,
+        dry_run: bool = False,
+        cpu_limit_sec: int = 0,
+        memory_limit_mb: int = 0,
+        file_size_limit_mb: int = 0,
+        process_limit: int = 0,
+        max_commands: int = 20,
+    ) -> ToolResult:
+        """Execute a sequence of shell commands with structured per-step results."""
+        started = time.monotonic()
+        settings = get_settings()
+        if not commands:
+            return _result(
+                "execute_batch",
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000,
+                error_code="COMMANDS_REQUIRED",
+                error_stage="validation",
+                message="commands is required",
+            )
+        if len(commands) > max_commands:
+            return _result(
+                "execute_batch",
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000,
+                error_code="COMMAND_LIMIT_EXCEEDED",
+                error_stage="validation",
+                message=f"commands must contain at most {max_commands} items",
+                data={"command_count": len(commands), "max_commands": max_commands},
+            )
+
+        timeout = min(timeout or settings.default_command_timeout, 600)
+        env = env or {}
+        planned_commands = [
+            {
+                "index": index,
+                "command": command,
+                "cwd": _safe_cwd(cwd) or None,
+                "timeout": timeout,
+                "env_keys": sorted(env.keys()),
+                "capture_usage": capture_usage,
+                "limits": {
+                    "cpu_seconds": max(0, cpu_limit_sec),
+                    "memory_mb": max(0, memory_limit_mb),
+                    "file_size_mb": max(0, file_size_limit_mb),
+                    "process_count": max(0, process_limit),
+                },
+            }
+            for index, command in enumerate(commands, start=1)
+        ]
+
+        if dry_run:
+            return _result(
+                "execute_batch",
+                ok=True,
+                duration_ms=(time.monotonic() - started) * 1000,
+                message="Dry run completed without executing commands.",
+                data={
+                    "dry_run": True,
+                    "cwd": _safe_cwd(cwd) or None,
+                    "command_count": len(commands),
+                    "timeout": timeout,
+                    "capture_usage": capture_usage,
+                    "stop_on_error": stop_on_error,
+                    "max_commands": max_commands,
+                    "limits": {
+                        "cpu_seconds": max(0, cpu_limit_sec),
+                        "memory_mb": max(0, memory_limit_mb),
+                        "file_size_mb": max(0, file_size_limit_mb),
+                        "process_count": max(0, process_limit),
+                    },
+                    "planned_commands": planned_commands,
+                },
+            )
+
+        pool = get_pool()
+        try:
+            conn = await pool.acquire()
+        except Exception as exc:
+            return _result(
+                "execute_batch",
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000,
+                stderr_text=str(exc),
+                error_code="BATCH_EXECUTION_SETUP_FAILED",
+                error_stage="setup",
+                message="Failed to prepare batch execution.",
+                data={"command_count": len(commands), "dry_run": False},
+            )
+
+        command_results: list[BatchCommandResult] = []
+        stdout_sections: list[str] = []
+        stderr_sections: list[str] = []
+        capability_data: dict[str, Any] = {}
+        try:
+            try:
+                capabilities = await conn.probe_capabilities()
+            except Exception as exc:
+                return _result(
+                    "execute_batch",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    stderr_text=str(exc),
+                    error_code="BATCH_EXECUTION_SETUP_FAILED",
+                    error_stage="setup",
+                    message="Failed to probe execution capabilities.",
+                    data={"command_count": len(commands), "dry_run": False},
+                )
+            for index, command in enumerate(commands, start=1):
+                command_start = time.monotonic()
+                try:
+                    result, usage, capability_data, duration_ms = await _run_execution_on_connection(
+                        conn,
+                        capabilities=capabilities,
+                        command=command,
+                        cwd=cwd,
+                        timeout=timeout,
+                        env=env,
+                        capture_usage=capture_usage,
+                        cpu_limit_sec=cpu_limit_sec,
+                        memory_limit_mb=memory_limit_mb,
+                        file_size_limit_mb=file_size_limit_mb,
+                        process_limit=process_limit,
+                    )
+                except Exception as exc:
+                    command_results.append(
+                        BatchCommandResult(
+                            index=index,
+                            command=command,
+                            ok=False,
+                            exit_code=None,
+                            duration_ms=(time.monotonic() - command_start) * 1000,
+                            error_code="BATCH_EXECUTION_FAILED",
+                            error_stage="execution",
+                            stdout_preview="",
+                            stderr_preview=str(exc),
+                            usage=None,
+                        )
+                    )
+                    stderr_sections.append(f"[{index}] $ {command}\n{str(exc)}")
+                    if stop_on_error:
+                        break
+                    continue
+
+                error_code, error_stage = _error_code_for_result(result)
+                stdout_preview = preview_text(result.stdout, settings.output_preview_bytes) or ""
+                stderr_preview = preview_text(result.stderr, settings.error_preview_bytes) or ""
+                command_results.append(
+                    BatchCommandResult(
+                        index=index,
+                        command=command,
+                        ok=result.ok,
+                        exit_code=result.exit_code,
+                        duration_ms=duration_ms,
+                        error_code=error_code,
+                        error_stage=error_stage,
+                        stdout_preview=stdout_preview,
+                        stderr_preview=stderr_preview,
+                        usage=usage,
+                    )
+                )
+                if result.stdout.strip():
+                    stdout_sections.append(f"[{index}] $ {command}\n{result.stdout.rstrip()}")
+                if result.stderr.strip():
+                    stderr_sections.append(f"[{index}] $ {command}\n{result.stderr.rstrip()}")
+                if not result.ok and stop_on_error:
+                    break
+        finally:
+            pool.release(conn)
+
+        batch_usage = _aggregate_batch_usage(command_results)
+        total_duration_ms = (time.monotonic() - started) * 1000
+        succeeded = sum(1 for item in command_results if item.ok)
+        failed = len(command_results) - succeeded
+        all_ok = failed == 0 and len(command_results) == len(commands)
+        aborted = len(command_results) < len(commands)
+        if aborted and failed:
+            error_code = "BATCH_ABORTED_ON_ERROR" if stop_on_error else "BATCH_PARTIAL_FAILURE"
+            error_stage = "execution"
+            message = (
+                "Batch execution stopped after a command failed."
+                if stop_on_error
+                else "Batch completed with failures."
+            )
+        elif failed:
+            error_code = "BATCH_PARTIAL_FAILURE"
+            error_stage = "execution"
+            message = "Batch completed with failures."
+        else:
+            error_code = None
+            error_stage = None
+            message = None
+
+        return _result(
+            "execute_batch",
+            ok=all_ok,
+            duration_ms=total_duration_ms,
+            stdout_text="\n\n".join(stdout_sections),
+            stderr_text="\n\n".join(stderr_sections),
+            error_code=error_code,
+            error_stage=error_stage,
+            message=message,
+            data={
+                "dry_run": False,
+                "cwd": _safe_cwd(cwd) or None,
+                "command_count": len(commands),
+                "executed_count": len(command_results),
+                "success_count": succeeded,
+                "failure_count": failed,
+                "aborted": aborted,
+                "stop_on_error": stop_on_error,
+                "timeout": timeout,
+                "capture_usage": capture_usage,
+                "max_commands": max_commands,
+                "limits": {
+                    "cpu_seconds": max(0, cpu_limit_sec),
+                    "memory_mb": max(0, memory_limit_mb),
+                    "file_size_mb": max(0, file_size_limit_mb),
+                    "process_count": max(0, process_limit),
+                },
+                "results": [item.to_dict() for item in command_results],
+                "planned_commands": planned_commands,
+                "capabilities": capability_data if command_results else {},
+            },
+            usage=batch_usage,
         )
 
     @mcp.tool(structured_output=True)

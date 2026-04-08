@@ -4,10 +4,117 @@ from __future__ import annotations
 
 import json
 import shlex
+import time
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from mcp_nexus.server import get_pool
+from mcp_nexus.results import ToolResult, build_tool_result
+from mcp_nexus.server import get_artifacts, get_pool, get_settings, tool_context
+
+
+def _result(
+    tool_name: str,
+    *,
+    ok: bool,
+    duration_ms: float,
+    stdout_text: str = "",
+    stderr_text: str = "",
+    error_code: str | None = None,
+    error_stage: str | None = None,
+    message: str | None = None,
+    exit_code: int | None = None,
+    data: Any = None,
+) -> ToolResult:
+    settings = get_settings()
+    return build_tool_result(
+        context=tool_context(tool_name),
+        artifacts=get_artifacts(),
+        ok=ok,
+        duration_ms=duration_ms,
+        stdout_text=stdout_text,
+        stderr_text=stderr_text,
+        output_limit=settings.output_limit_bytes,
+        error_limit=settings.error_limit_bytes,
+        output_preview_limit=settings.output_preview_bytes,
+        error_preview_limit=settings.error_preview_bytes,
+        error_code=error_code,
+        error_stage=error_stage,
+        message=message,
+        exit_code=exit_code,
+        data=data,
+    )
+
+
+def _diff_status_label(code: str) -> str:
+    return {
+        "A": "added",
+        "D": "deleted",
+        "M": "modified",
+        "R": "renamed",
+        "C": "copied",
+        "T": "type_changed",
+        "U": "conflicted",
+        "X": "unknown",
+        "B": "broken",
+    }.get(code, "unknown")
+
+
+def _parse_compare_status_output(output: str, *, max_entries: int = 200) -> dict[str, Any]:
+    changes: list[dict[str, Any]] = []
+    counts = {
+        "added": 0,
+        "deleted": 0,
+        "modified": 0,
+        "renamed": 0,
+        "copied": 0,
+        "type_changed": 0,
+        "conflicted": 0,
+        "unknown": 0,
+    }
+    entry_count = 0
+
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        entry_count += 1
+        parts = line.split("\t")
+        status_code = parts[0].strip()
+        code = status_code[0] if status_code else "?"
+        label = _diff_status_label(code)
+        counts[label] = counts.get(label, 0) + 1
+        entry: dict[str, Any] = {
+            "status_code": status_code,
+            "status": label,
+        }
+        if code in {"R", "C"} and len(parts) >= 3:
+            entry["old_path"] = parts[1]
+            entry["new_path"] = parts[2]
+        elif len(parts) >= 2:
+            entry["path"] = parts[1]
+        else:
+            entry["raw"] = line
+        if len(changes) < max_entries:
+            changes.append(entry)
+
+    return {
+        "changes": changes,
+        "counts": counts,
+        "truncated": entry_count > len(changes),
+        "total": entry_count,
+    }
+
+
+def _path_kind_command(label: str, path: str) -> str:
+    quoted = shlex.quote(path)
+    return (
+        f"if [ -L {quoted} ]; then printf '{label}=symlink\\n'; "
+        f"elif [ -d {quoted} ]; then printf '{label}=directory\\n'; "
+        f"elif [ -f {quoted} ]; then printf '{label}=file\\n'; "
+        f"elif [ -e {quoted} ]; then printf '{label}=other\\n'; "
+        f"else printf '{label}=missing\\n'; fi"
+    )
 
 
 def register(mcp: FastMCP):
@@ -179,6 +286,189 @@ def register(mcp: FastMCP):
                     "base": path,
                     "matches": result.stdout.strip() if result.stdout.strip() else "(no matches)",
                 }
+            )
+        finally:
+            pool.release(conn)
+
+    @mcp.tool(structured_output=True)
+    async def compare_paths(
+        left_path: str,
+        right_path: str,
+        include_patch: bool = False,
+        context_lines: int = 3,
+        max_entries: int = 200,
+        ignore_whitespace: bool = False,
+    ) -> ToolResult:
+        """Compare two files or directory trees with structured diff summaries."""
+        started = time.monotonic()
+        pool = get_pool()
+        conn = await pool.acquire()
+        try:
+            kind_probe = await conn.run_full(
+                "\n".join(
+                    [
+                        _path_kind_command("left_kind", left_path),
+                        _path_kind_command("right_kind", right_path),
+                    ]
+                ),
+                timeout=10,
+            )
+            if not kind_probe.ok:
+                return _result(
+                    "compare_paths",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    stdout_text=kind_probe.stdout,
+                    stderr_text=kind_probe.stderr,
+                    error_code="PATH_KIND_PROBE_FAILED",
+                    error_stage="inspection",
+                    message="Failed to inspect comparison targets.",
+                    data={"left_path": left_path, "right_path": right_path},
+                )
+
+            kinds: dict[str, str] = {}
+            for raw_line in kind_probe.stdout.splitlines():
+                if "=" not in raw_line:
+                    continue
+                key, value = raw_line.split("=", 1)
+                kinds[key.strip()] = value.strip()
+
+            left_kind = kinds.get("left_kind", "unknown")
+            right_kind = kinds.get("right_kind", "unknown")
+            if "missing" in {left_kind, right_kind}:
+                return _result(
+                    "compare_paths",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    error_code="PATH_NOT_FOUND",
+                    error_stage="inspection",
+                    message="One or both comparison targets were not found.",
+                    data={
+                        "left_path": left_path,
+                        "right_path": right_path,
+                        "left_kind": left_kind,
+                        "right_kind": right_kind,
+                    },
+                )
+
+            git_check = await conn.run_full("which git 2>/dev/null", timeout=5)
+            if not git_check.ok:
+                return _result(
+                    "compare_paths",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    error_code="GIT_UNAVAILABLE",
+                    error_stage="capability_probe",
+                    message="git is not installed on the target host.",
+                    data={
+                        "left_path": left_path,
+                        "right_path": right_path,
+                        "left_kind": left_kind,
+                        "right_kind": right_kind,
+                    },
+                )
+
+            ignore_flag = " --ignore-all-space" if ignore_whitespace else ""
+            compare_root = f"-- {shlex.quote(left_path)} {shlex.quote(right_path)}"
+            name_status_cmd = (
+                "git diff --no-index --no-ext-diff"
+                f"{ignore_flag} --name-status {compare_root}"
+            )
+            summary_cmd = f"git diff --no-index --no-ext-diff{ignore_flag} --summary {compare_root}"
+            patch_cmd = f"git diff --no-index --no-ext-diff{ignore_flag} -U{max(0, context_lines)} {compare_root}"
+
+            name_status_result = await conn.run_full(name_status_cmd, timeout=60)
+            if name_status_result.exit_code not in {0, 1}:
+                return _result(
+                    "compare_paths",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    stdout_text=name_status_result.stdout,
+                    stderr_text=name_status_result.stderr,
+                    error_code="DIFF_ENGINE_FAILED",
+                    error_stage="inspection",
+                    message="Failed to compute the comparison.",
+                    data={
+                        "left_path": left_path,
+                        "right_path": right_path,
+                        "left_kind": left_kind,
+                        "right_kind": right_kind,
+                    },
+                    exit_code=name_status_result.exit_code,
+                )
+
+            summary_result = await conn.run_full(summary_cmd, timeout=60)
+            patch_result = None
+            if include_patch:
+                patch_result = await conn.run_full(patch_cmd, timeout=120)
+
+            parsed = _parse_compare_status_output(name_status_result.stdout, max_entries=max_entries)
+            identical = name_status_result.exit_code == 0
+            diff_detected = name_status_result.exit_code == 1
+            summary_text = summary_result.stdout.strip() or summary_result.stderr.strip()
+            report_parts = [
+                f"left: {left_path} ({left_kind})",
+                f"right: {right_path} ({right_kind})",
+                "engine: git --no-index",
+                f"status: {'identical' if identical else 'different'}",
+                (
+                    "changes: "
+                    f"added {parsed['counts']['added']}, deleted {parsed['counts']['deleted']}, "
+                    f"modified {parsed['counts']['modified']}, renamed {parsed['counts']['renamed']}, "
+                    f"copied {parsed['counts']['copied']}, type_changed {parsed['counts']['type_changed']}"
+                ),
+            ]
+            if summary_text:
+                report_parts.extend(["summary:", summary_text])
+            if parsed["changes"]:
+                report_parts.extend(["name-status preview:", json.dumps(parsed["changes"], indent=2)])
+            if include_patch and patch_result is not None:
+                if patch_result.exit_code not in {0, 1}:
+                    return _result(
+                        "compare_paths",
+                        ok=False,
+                        duration_ms=(time.monotonic() - started) * 1000,
+                        stdout_text=patch_result.stdout,
+                        stderr_text=patch_result.stderr,
+                        error_code="DIFF_ENGINE_FAILED",
+                        error_stage="inspection",
+                        message="Failed to compute the patch preview.",
+                        data={
+                            "left_path": left_path,
+                            "right_path": right_path,
+                            "left_kind": left_kind,
+                            "right_kind": right_kind,
+                        },
+                        exit_code=patch_result.exit_code,
+                    )
+                report_parts.extend(["patch preview:", patch_result.stdout.strip()])
+
+            message = "Paths are identical." if identical else "Paths differ."
+            return _result(
+                "compare_paths",
+                ok=True,
+                duration_ms=(time.monotonic() - started) * 1000,
+                stdout_text="\n\n".join(part for part in report_parts if part),
+                message=message,
+                exit_code=name_status_result.exit_code,
+                data={
+                    "left_path": left_path,
+                    "right_path": right_path,
+                    "left_kind": left_kind,
+                    "right_kind": right_kind,
+                    "engine": "git --no-index",
+                    "identical": identical,
+                    "diff_detected": diff_detected,
+                    "ignore_whitespace": ignore_whitespace,
+                    "context_lines": max(0, context_lines),
+                    "max_entries": max_entries,
+                    "counts": parsed["counts"],
+                    "changes_preview": parsed["changes"],
+                    "changes_truncated": parsed["truncated"],
+                    "total_changes": parsed["total"],
+                    "summary": summary_text or None,
+                    "patch_included": include_patch,
+                },
             )
         finally:
             pool.release(conn)

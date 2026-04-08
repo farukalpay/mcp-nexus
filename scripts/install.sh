@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # MCP Nexus — Quick Install Script
-# Usage: curl -sSL https://raw.githubusercontent.com/lightcap-ai/mcp-nexus/main/scripts/install.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/farukalpay/mcp-nexus/main/scripts/install.sh | bash
 
 set -euo pipefail
 
@@ -17,7 +17,7 @@ echo
 # Check Python version
 PYTHON=$(command -v python3 || true)
 if [ -z "$PYTHON" ]; then
-    echo -e "${RED}Error: Python 3.11+ is required${NC}"
+    echo -e "${RED}Error: Python 3.10+ is required${NC}"
     exit 1
 fi
 
@@ -25,23 +25,19 @@ PY_VERSION=$($PYTHON -c "import sys; print(f'{sys.version_info.major}.{sys.versi
 PY_MAJOR=$($PYTHON -c "import sys; print(sys.version_info.major)")
 PY_MINOR=$($PYTHON -c "import sys; print(sys.version_info.minor)")
 
-if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
-    echo -e "${RED}Error: Python 3.11+ required (found $PY_VERSION)${NC}"
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }; then
+    echo -e "${RED}Error: Python 3.10+ required (found $PY_VERSION)${NC}"
     exit 1
 fi
 echo -e "${GREEN}✓${NC} Python $PY_VERSION"
 
-# Clone or update
+# Install layout
 INSTALL_DIR="${MCP_NEXUS_DIR:-$HOME/mcp-nexus}"
-if [ -d "$INSTALL_DIR/.git" ]; then
-    echo "Updating existing installation..."
-    cd "$INSTALL_DIR"
-    git pull --ff-only
-else
-    echo "Installing to $INSTALL_DIR..."
-    git clone https://github.com/lightcap-ai/mcp-nexus.git "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
-fi
+PIP_SPEC="${MCP_NEXUS_PIP_SPEC:-git+https://github.com/farukalpay/mcp-nexus.git}"
+INIT_ARGS="${MCP_NEXUS_INIT_ARGS:-}"
+mkdir -p "$INSTALL_DIR"
+cd "$INSTALL_DIR"
+echo "Using install directory: $INSTALL_DIR"
 
 # Virtual environment
 if [ ! -d ".venv" ]; then
@@ -52,14 +48,16 @@ fi
 source .venv/bin/activate
 echo -e "${GREEN}✓${NC} Virtual environment"
 
-# Dependencies
-pip install -q -e ".[dev]" 2>/dev/null
-echo -e "${GREEN}✓${NC} Dependencies installed"
+# Package install
+python -m pip install -U pip >/dev/null
+python -m pip install -U "$PIP_SPEC"
+echo -e "${GREEN}✓${NC} Installed package from $PIP_SPEC"
 
-# .env setup
+# Scaffold setup
 if [ ! -f ".env" ]; then
-    cp .env.example .env
-    echo -e "${BLUE}→${NC} Created .env from template — edit it with your server details"
+    # shellcheck disable=SC2086
+    mcp-nexus init "$INSTALL_DIR" $INIT_ARGS
+    echo -e "${GREEN}✓${NC} Runtime scaffold generated"
 else
     echo -e "${GREEN}✓${NC} .env exists"
 fi
@@ -74,9 +72,6 @@ echo "    cd $INSTALL_DIR"
 echo "    source .venv/bin/activate"
 echo "    nano .env                        # Set your server credentials"
 echo "    mcp-nexus serve                  # Start MCP server"
-echo
-echo "  Or with Docker:"
-echo "    docker compose up -d"
 echo
 echo "  Health check:"
 echo "    mcp-nexus health"
