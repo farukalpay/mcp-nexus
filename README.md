@@ -6,18 +6,20 @@
   <p align="center">
     <strong>Turn any AI assistant into a full-stack DevOps engineer for your server.</strong>
     <br/>
-    156 tools for files, terminal, git, services, databases, debugging, monitoring, deployment, and observability<br/>
+    153 tools for files, terminal, git, services, databases, debugging, monitoring, deployment, and observability<br/>
     — with a built-in intelligence layer that learns how you work.
   </p>
   <p align="center">
     <a href="#hosted-gateway">Hosted Gateway</a> &bull;
     <a href="#quick-start">Quick Start</a> &bull;
     <a href="#intelligence">Intelligence</a> &bull;
-    <a href="#tools">156 Tools</a> &bull;
+    <a href="#tools">153 Tools</a> &bull;
     <a href="#architecture">Architecture</a> &bull;
     <a href="#configuration">Config</a>
   </p>
-</p>  
+  <p align="center">
+  </p>
+</p>
 
 ---
 
@@ -31,21 +33,12 @@ https://lightcap.ai/mcp/nexus
 
 Connect your AI client directly, enter your own server credentials once, and let ChatGPT or Claude operate that machine through the gateway. No agent install, no daemon on your server, no custom packaging step.
 
-Open that URL in a browser and you now get a real connect page, not a blank MCP endpoint. It explains the flow, shows the MCP and OAuth values, and links directly to GitHub and the docs while preserving the same path for actual MCP clients.
-
 Why people use the hosted gateway:
 
 - Bring any Linux server you already own. MCP Nexus handles the AI-facing side.
 - Use one connection for terminal, files, git, deploy, database, process control, monitoring, and debugging.
 - Keep the target explicit. You type your own server host, SSH user, SSH port, and SSH password at connect time.
 - Skip setup overhead when you just want to put ChatGPT on a real machine and start shipping.
-
-What that page does for humans:
-
-- Shows the exact MCP URL to paste into ChatGPT or Claude.
-- Shows manual OAuth values for clients that still ask for them.
-- Explains which values are OAuth credentials and which values are your real server credentials.
-- Links back to the GitHub repository and README for deeper setup details.
 
 **Claude Desktop** (`claude_desktop_config.json`):
 
@@ -151,12 +144,11 @@ curl -X POST https://lightcap.ai/oauth/token \
   }'
 ```
 
-The gateway validates by connecting to your server via SSH. Once authenticated, all 156 MCP tools operate on YOUR server through the Lightcap gateway. Full audit logging, rate limiting, and connection pooling included.
+The gateway validates by connecting to your server via SSH. Once authenticated, all 153 MCP tools operate on YOUR server through the Lightcap gateway. Full audit logging, rate limiting, and connection pooling included.
 
-```mermaid
-flowchart LR
-    AI["Your AI"] -->|MCP / HTTPS| Gateway["lightcap.ai/mcp/nexus<br/>Hosted Gateway"]
-    Gateway -->|SSH| Target["Your Server<br/>Target Host"]
+```
+Your AI ──MCP/HTTPS──> lightcap.ai/mcp/nexus ──SSH──> Your Server
+                            (gateway)                   (target)
 ```
 
 > **Self-hosted?** Skip the gateway and run MCP Nexus on your own machine — see [Quick Start](#quick-start) below.
@@ -169,51 +161,24 @@ Most MCP servers give you tools. Nexus gives you tools **that remember**.
 
 Every command you run, every service you restart, every file you edit — Nexus quietly learns your patterns. The next time you connect, it already knows what you were working on, which paths you use most, and what you'll probably need next.
 
-```mermaid
-flowchart LR
-    Client["You via Claude / GPT"] -->|MCP| Nexus
-    Nexus -->|SSH| Host
-
-    subgraph NexusBox["MCP Nexus"]
-        direction TB
-        Nexus["Gateway + Tool Surface"]
-        Intelligence["Intelligence"]
-        Memory["Session memory"]
-        Preferences["Preference learning"]
-        Workflows["Workflow detection"]
-        Suggestions["Smart suggestions"]
-        Nexus --> Intelligence
-        Intelligence --> Memory
-        Intelligence --> Preferences
-        Intelligence --> Workflows
-        Intelligence --> Suggestions
-    end
-
-    subgraph TargetBox["Your Server"]
-        direction TB
-        Host["Execution Target"]
-        Files["Files<br/>read, write, edit, search, diff"]
-        Terminal["Terminal<br/>execute commands, scripts"]
-        Git["Git<br/>commit, push, pull, branch"]
-        Services["Services<br/>systemd, docker, nginx"]
-        Database["Database<br/>PostgreSQL queries"]
-        Debug["Debug<br/>lint, typecheck, syntax, TODOs"]
-        Monitoring["Monitoring<br/>health, metrics, logs"]
-        Deploy["Deploy<br/>sync, restart, rollback"]
-        Network["Network<br/>ports, DNS, SSL, forwarding"]
-        Packages["Packages<br/>pip, apt, npm"]
-    end
-
-    Host --> Files
-    Host --> Terminal
-    Host --> Git
-    Host --> Services
-    Host --> Database
-    Host --> Debug
-    Host --> Monitoring
-    Host --> Deploy
-    Host --> Network
-    Host --> Packages
+```
+You (via Claude/GPT) ──MCP──> MCP Nexus ──SSH──> Your Server
+                                  │                   ├── Files (read, write, edit, search, diff)
+                                  │                   ├── Terminal (execute commands, scripts)
+                                  │                   ├── Git (commit, push, pull, branch)
+                                  │                   ├── Services (systemd, docker, nginx)
+                                  │                   ├── Database (PostgreSQL queries)
+                                  │                   ├── Debug (lint, typecheck, syntax, TODOs)
+                                  │                   ├── Monitoring (health, metrics, logs)
+                                  │                   ├── Deploy (sync, restart, rollback)
+                                  │                   ├── Network (ports, DNS, SSL, forwarding)
+                                  │                   └── Packages (pip, apt, npm)
+                                  │
+                              Intelligence
+                            ├── Session memory
+                            ├── Preference learning
+                            ├── Workflow detection
+                            └── Smart suggestions
 ```
 
 ### What makes it different
@@ -222,7 +187,7 @@ flowchart LR
 |---|---|---|
 | **Hosted gateway** | Install-only | Use `lightcap.ai/mcp/nexus` instantly — zero setup |
 | **Memory** | Stateless — every session starts from zero | Remembers your sessions, preferences, and workflows |
-| **Scope** | Single-purpose (just files, just git) | 156 tools covering the full DevOps stack |
+| **Scope** | Single-purpose (just files, just git) | 153 tools covering the full DevOps stack |
 | **Debugging** | None | Lint, typecheck, syntax check, error search, symbol finder |
 | **Connection** | Spawns new processes per call | Pooled SSH connections with auto-reconnect |
 | **Recovery** | You notice when things break | Watchdog auto-restarts crashed services |
@@ -236,30 +201,22 @@ flowchart LR
 ### Install
 
 ```bash
-mkdir -p ~/mcp-nexus
-cd ~/mcp-nexus
-python3 -m venv .venv
-source .venv/bin/activate
-pip install "git+https://github.com/farukalpay/mcp-nexus.git"
-mcp-nexus init .
+pip install mcp-nexus
 ```
 
-Or from a local checkout:
+Or from source:
 
 ```bash
-git clone https://github.com/farukalpay/mcp-nexus.git
+git clone https://github.com/lightcap-ai/mcp-nexus.git
 cd mcp-nexus
-python -m venv .venv && source .venv/bin/activate
 pip install -e .
-mcp-nexus init .
 ```
 
 ### Configure
 
 ```bash
-mcp-nexus init .          # writes .env
-mcp-nexus init . --systemd
-# Edit .env with your server credentials
+cp .env.example .env
+# Edit with your server credentials
 ```
 
 Minimal `.env`:
@@ -270,8 +227,6 @@ NEXUS_SSH_KEY_PATH=~/.ssh/id_rsa
 ```
 
 > **Note:** `NEXUS_SSH_USER` defaults to `root`. If your host uses a different account, set it explicitly in `.env`. Any non-root user should have the permissions your tool set requires for service, package, and deployment operations.
-
-`mcp-nexus init` is the pip-first setup path. It writes a runnable `.env` in the target directory and can also generate a systemd unit example bound to the currently installed Python environment.
 
 ### Connect to your AI
 
@@ -398,29 +353,13 @@ Long-running jobs no longer need ad-hoc `nohup`, repeated `sleep`, or manual `ps
 
 The runner enables `PYTHONUNBUFFERED=1` by default and uses `stdbuf -oL -eL` when available, which fixes the common “process is busy but log file stays empty” failure mode for ML/data jobs and similar pipelines.
 
-### Deep Tool Surfaces
-
-These tools were added to remove repeated shell choreography, not to inflate the catalog:
-
-- `execute_batch` runs a sequence of commands with shared limits, per-step results, and a `dry_run` preview. Use it for smoke tests, multi-step deploy validation, and command plans you want to inspect before execution.
-- `git_diagnose` turns repo state into one structured report: branch, upstream, ahead/behind, conflicts, worktrees, stashes, and optional diff stats.
-- `compare_paths` compares two files or directory trees with structured change counts and patch previews. Large diffs spill into artifacts automatically.
-
-Example flows:
-
-1. Dry-run a release command batch, then rerun the exact same list with `stop_on_error=true`.
-2. Call `git_diagnose` before any pull or commit to surface detached HEAD state or unresolved merge/rebase work.
-3. Use `compare_paths` to preview a release tree against the live tree before activation or rollback.
-
-These behaviors are identical in hosted and self-host mode because they run against the connected target host through the same managed execution layer.
-
 ---
 
 ## Tools
 
-MCP Nexus currently exposes **156 tools** across execution, infrastructure, deployment, intelligence, and audit layers.
+MCP Nexus currently exposes **153 tools** across execution, infrastructure, deployment, intelligence, and audit layers.
 
-### Filesystem (20 tools)
+### Filesystem (19 tools)
 
 | Tools | Description |
 |------|-------------|
@@ -428,26 +367,24 @@ MCP Nexus currently exposes **156 tools** across execution, infrastructure, depl
 | `write_file`, `edit_file`, `replace_in_file` | Write, patch, and replace file contents |
 | `list_directory`, `tree`, `search_files`, `search_content` | Explore directories and search content quickly |
 | `file_info`, `file_exists`, `count_lines` | Inspect metadata and file characteristics |
-| `compare_paths` | Compare files or directory trees with structured summaries and patch previews |
 | `move_file`, `delete_file`, `create_directory` | Perform filesystem mutations with safety guards |
 | `chmod_file`, `chown_file` | Adjust permissions and ownership |
 
-### Terminal & Runtime (10 tools)
+### Terminal & Runtime (9 tools)
 
 | Tools | Description |
 |------|-------------|
 | `execute_command` | Managed shell execution with usage metrics and optional CPU/memory/file/process limits |
 | `execute_script` | Multi-line script execution through any interpreter |
-| `execute_batch` | Execute a sequence of commands with shared limits, dry-run preview, and per-step results |
 | `execute_python` | Direct Python execution with optional reusable virtualenv sandbox |
 | `server_capabilities`, `environment_info`, `which_command` | Inspect runtime defaults, detected backends, and binary availability |
 | `create_python_sandbox`, `list_python_sandboxes`, `remove_python_sandbox` | Lifecycle management for reusable Python sandboxes on the target host |
 
-### Git (15 tools)
+### Git (14 tools)
 
 | Tools | Description |
 |------|-------------|
-| `git_status`, `git_diagnose`, `git_diff`, `git_log`, `git_show` | Inspect worktree state, diagnose repo health, history, and specific objects |
+| `git_status`, `git_diff`, `git_log`, `git_show` | Inspect worktree, history, and specific objects |
 | `git_stage`, `git_commit` | Stage explicitly and create commits |
 | `git_branch`, `git_fetch`, `git_pull`, `git_push` | Drive branch and remote sync workflows |
 | `git_remotes`, `git_tags`, `git_stash`, `git_blame` | Inspect remotes/tags, stash changes, and trace authorship |
@@ -546,7 +483,7 @@ flowchart TB
     Gateway --> Middleware["Auth + Rate Limit + Request Trace"]
     Middleware --> Registry["Stable Registry<br/>server_instance_id + registry_version"]
     Middleware --> Sessions["Session Store<br/>live binding + active DB profile"]
-    Registry --> Tools["Tool Catalog (156 tools)"]
+    Registry --> Tools["Tool Catalog (153 tools)"]
     Sessions --> Tools
     Tools --> Runtime["Capability Probe + Managed Execution + Python Sandbox"]
     Tools --> Jobs["Detached Job Layer<br/>run/wait/log/status"]
@@ -701,8 +638,6 @@ Creates a systemd service with auto-restart + nginx reverse proxy snippet. If `.
 
 The generated nginx snippet now includes `/mcp/nexus`, `/mcp`, `/health/nexus`, `/ready/nexus`, and `/version/nexus` so legacy clients and new diagnostics can coexist cleanly.
 
-If your domain is already served by another frontend application, do not let those OAuth and MCP paths fall through to the website router. Route them to MCP Nexus on the same public origin or ChatGPT Connect will fail.
-
 ### Release-Based Deploys
 
 The built-in deploy tools support a cleaner release flow than a one-off restart:
@@ -802,58 +737,6 @@ location = /oauth/token {
 
 > **Important:** ChatGPT `Connect` depends on `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/...`, `/authorize`, `/token`, `/register`, and `/oauth/consent` being reachable on the same public origin as `/mcp/nexus`. If any of those paths fall through to the website frontend, `Connect` will fail before the first tool call.
 
-### Same-Origin Frontend Apps
-
-If you already have a FastAPI or Starlette app on the public origin and MCP Nexus runs on an internal port, install the built-in proxy helper so your frontend app forwards the MCP and OAuth surface instead of returning its own 403/404 page.
-
-Install the optional extra first:
-
-```bash
-pip install "mcp-nexus[fastapi]"
-```
-
-```python
-from fastapi import FastAPI
-
-from mcp_nexus.public_proxy import install_fastapi_public_proxy
-
-app = FastAPI()
-
-install_fastapi_public_proxy(
-    app,
-    upstream_base_url="http://127.0.0.1:8766",
-)
-```
-
-The helper forwards these path groups by default:
-
-- `/mcp`
-- `/mcp/nexus`
-- `/.well-known/oauth-authorization-server`
-- `/.well-known/oauth-protected-resource/...`
-- `/authorize`
-- `/token`
-- `/register`
-- `/oauth/consent`
-- `/oauth/token`
-- `/health/nexus`
-- `/ready/nexus`
-- `/version/nexus`
-- `/info/nexus`
-
-Preferred production pattern:
-
-- Put nginx in front and proxy those paths directly to MCP Nexus.
-- If you must terminate routing inside an existing FastAPI app, use `install_fastapi_public_proxy(...)`.
-- Do not serve `/authorize` or `/.well-known/...` from your marketing or SPA router.
-- Let `GET /mcp/nexus` reach MCP Nexus for browsers too. It now renders a connect-style landing page with instructions, GitHub links, and manual OAuth values instead of a raw machine-only surface.
-
-Typical symptom of broken same-origin routing:
-
-- ChatGPT opens `/authorize?...` and you see `403 Forbidden`, `404`, or your website error page instead of the MCP Nexus consent screen.
-
-That is an ingress problem, not an OAuth problem and not an SSH localhost problem.
-
 ---
 
 ## Authentication
@@ -926,20 +809,10 @@ When running MCP Nexus privately on your own machine, disable public OAuth by om
 
 ---
 
-## Troubleshooting
-
-- If ChatGPT Connect opens a website page, 403, or 404 instead of MCP Nexus, your same-origin proxy is incomplete. Make sure `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/...`, `/authorize`, `/token`, `/register`, `/oauth/consent`, and `/mcp/nexus` all reach MCP Nexus on the same public origin.
-- If `git_diagnose` or `compare_paths` returns `GIT_UNAVAILABLE`, install `git` on the target host. `compare_paths` uses Git's `--no-index` diff engine so it can produce structured rename and summary output.
-- If `compare_paths` says a path is missing, verify both path arguments on the target host, not the MCP client.
-- If `execute_batch` stops after the first failure, that is by design when `stop_on_error=true`. Set it to `false` if you want the remaining commands to run and inspect each step's `error_code`.
-- Large outputs from `execute_batch` or `compare_paths` spill into local artifact files automatically. Check `artifact_paths`, `stdout_preview`, and `stderr_preview` in the tool result when the inline payload is truncated.
-
----
-
 ## Development
 
 ```bash
-git clone https://github.com/farukalpay/mcp-nexus.git
+git clone https://github.com/lightcap-ai/mcp-nexus.git
 cd mcp-nexus
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
