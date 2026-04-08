@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyHttpUrl, BaseModel
 
 from mcp_nexus.auth.oauth import GatewayOAuthProvider
@@ -25,6 +26,7 @@ from mcp_nexus.middleware.audit import AuditEntry, AuditLog
 from mcp_nexus.middleware.rate_limit import RateLimiter
 from mcp_nexus.registry import ToolRegistry, apply_registry_metadata, build_tool_registry
 from mcp_nexus.results import ArtifactManager, ToolExecutionContext
+from mcp_nexus.state import EncryptedStateStore
 from mcp_nexus.telemetry import (
     RequestTrace,
     SessionStateStore,
@@ -47,9 +49,22 @@ _session_store: SessionStateStore | None = None
 _artifacts: ArtifactManager | None = None
 _server_instance_id: str | None = None
 _oauth_provider: GatewayOAuthProvider | None = None
+_state_store: EncryptedStateStore | None = None
 
 # Per-request pool context (set by request middleware).
 _current_pool: contextvars.ContextVar[SSHPool | None] = contextvars.ContextVar("_current_pool", default=None)
+
+
+def _transport_security_settings(settings: Settings) -> TransportSecuritySettings | None:
+    allowed_hosts = settings.transport_allowed_hosts
+    allowed_origins = settings.transport_allowed_origins
+    if not allowed_hosts and not allowed_origins:
+        return None
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
 
 
 def get_pool() -> SSHPool:
@@ -136,13 +151,17 @@ def tool_context(tool_name: str) -> ToolExecutionContext:
 def create_server(settings: Settings | None = None) -> FastMCP:
     """Create and configure the MCP server with all tools."""
     global _gateway, _settings, _memory, _audit, _rate_limiter, _tool_registry, _session_store, _artifacts
-    global _server_instance_id, _oauth_provider
+    global _server_instance_id, _oauth_provider, _state_store
 
     if settings is None:
         settings = Settings()
     _settings = settings
     _server_instance_id = uuid4().hex
-    _gateway = GatewayManager(settings)
+    _state_store = EncryptedStateStore(
+        settings.expanded_path(settings.state_root),
+        settings.state_encryption_key,
+    )
+    _gateway = GatewayManager(settings, state_store=_state_store)
     _oauth_provider = None
 
     audit_log_file = settings.audit_log_file or f"{settings.expanded_path(settings.data_dir)}/audit.jsonl"
@@ -163,7 +182,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         service_documentation_url = (
             AnyHttpUrl(settings.oauth_service_documentation_url) if settings.oauth_service_documentation_url else None
         )
-        _oauth_provider = GatewayOAuthProvider(settings, _gateway)
+        _oauth_provider = GatewayOAuthProvider(settings, _gateway, state_store=_state_store)
         auth_settings = AuthSettings(
             issuer_url=issuer_url,
             service_documentation_url=service_documentation_url,
@@ -182,16 +201,24 @@ def create_server(settings: Settings | None = None) -> FastMCP:
             "MCP Nexus provides remote server management with explicit registry metadata and session diagnostics. "
             "Use tools to inspect files, execute commands, query databases, manage services, and deploy code. "
             "Registry metadata includes stable tool bindings, server instance id, and registry version. "
-            "Prefer db_profiles and db_use to select database backends without exposing secrets in tool arguments."
+            "Prefer db_profiles and db_use to select database backends without exposing secrets in tool arguments. "
+            "Use db_client_status or db_client_bootstrap before Python-based database work "
+            "when driver availability is unclear. "
+            "When using execute_python, execute_python_file, or execute_script, reference already-authorized "
+            "resources instead of embedding raw passwords or long-lived tokens into code. "
+            "Prefer db_export_csv with output_path plus tabular_dataset_profile or train_tabular_classifier "
+            "for data workflows instead of long inline shell or Python payloads."
         ),
         host=settings.host,
         port=settings.port,
         streamable_http_path=settings.mcp_path,
         auth=auth_settings,
         auth_server_provider=_oauth_provider,
+        transport_security=_transport_security_settings(settings),
     )
 
     from mcp_nexus.tools import (
+        analysis,
         database,
         debug,
         deploy,
@@ -208,6 +235,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
 
     filesystem.register(mcp)
     terminal.register(mcp)
+    analysis.register(mcp)
     git.register(mcp)
     process.register(mcp)
     database.register(mcp)
@@ -783,7 +811,10 @@ def create_app(settings: Settings | None = None, enable_watchdog: bool = True):
                 status_code=401,
             )
 
-        return JSONResponse(token.to_dict())
+        binding = gateway.get_binding(token.binding_id)
+        if binding is None:
+            return JSONResponse({"error": "binding_unavailable"}, status_code=500)
+        return JSONResponse(token.response_payload(binding))
 
     async def oauth_consent_get_endpoint(request):
         provider = get_oauth_provider()
@@ -834,9 +865,13 @@ def create_app(settings: Settings | None = None, enable_watchdog: bool = True):
         "_custom_starlette_routes",
         [
             Route("/health", health_endpoint, methods=["GET"]),
+            Route("/health/nexus", health_endpoint, methods=["GET"]),
             Route("/ready", ready_endpoint, methods=["GET"]),
+            Route("/ready/nexus", ready_endpoint, methods=["GET"]),
             Route("/version", version_endpoint, methods=["GET"]),
+            Route("/version/nexus", version_endpoint, methods=["GET"]),
             Route("/info", info_endpoint, methods=["GET"]),
+            Route("/info/nexus", info_endpoint, methods=["GET"]),
             Route("/tool-registry", tool_registry_endpoint, methods=["GET"]),
             Route("/sessions", sessions_endpoint, methods=["GET"]),
             Route("/session/{session_id}", session_endpoint, methods=["GET"]),

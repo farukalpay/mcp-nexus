@@ -9,6 +9,10 @@ services:
       - "8766:8766"
     env_file:
       - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - mcp-nexus-data:/home/nexus/.mcp-nexus
     healthcheck:
       test: ["CMD", "python", "-m", "mcp_nexus", "health"]
       interval: 30s
@@ -20,3 +24,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  mcp-nexus-data:

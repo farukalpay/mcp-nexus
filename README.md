@@ -6,14 +6,14 @@
   <p align="center">
     <strong>Turn any AI assistant into a full-stack DevOps engineer for your server.</strong>
     <br/>
-    156 tools for files, terminal, git, services, databases, debugging, monitoring, deployment, and observability<br/>
+    163 tools for files, terminal, git, services, databases, debugging, monitoring, deployment, and observability<br/>
     — with a built-in intelligence layer that learns how you work.
   </p>
   <p align="center">
     <a href="#hosted-gateway">Hosted Gateway</a> &bull;
     <a href="#quick-start">Quick Start</a> &bull;
     <a href="#intelligence">Intelligence</a> &bull;
-    <a href="#tools">156 Tools</a> &bull;
+    <a href="#tools">163 Tools</a> &bull;
     <a href="#architecture">Architecture</a> &bull;
     <a href="#configuration">Config</a>
   </p>
@@ -103,6 +103,9 @@ If the ChatGPT UI asks for manual OAuth fields instead of using discovery, use:
 - **MCP URL:** `https://lightcap.ai/mcp/nexus`
 - **Auth URL:** `https://lightcap.ai/authorize`
 - **Token URL:** `https://lightcap.ai/token`
+- **Registration URL:** `https://lightcap.ai/register`
+- **Authorization server base:** `https://lightcap.ai`
+- **Resource:** `https://lightcap.ai/mcp/nexus`
 - **Client ID:** `nexus-lightcap-prod`
 - **Client Secret:** `nxs_sec_9f78f08ec360-lc2026`
 - **Scope:** `nexus` or leave it blank if the client allows that
@@ -117,6 +120,15 @@ Do not use these values in ChatGPT Connect:
 - Your SSH password as OAuth `client_secret`
 
 > **Important:** ChatGPT Connect uses standard OAuth discovery plus the consent screen. SSH host, user, port, password, or key belong in the consent step, not in OAuth client fields.
+
+If ChatGPT opens a page on `https://lightcap.ai/...`, that is expected. That page is the OAuth consent screen. Enter your real SSH target there:
+
+- **SSH host:** your server host or IP such as `149.102.155.77`
+- **SSH user:** your SSH username such as `root`
+- **SSH port:** usually `22`
+- **SSH password / key:** your real SSH credential for that server
+
+Do not reuse those SSH values as OAuth `client_id` or `client_secret`.
 
 If you self-host MCP Nexus and want manual OAuth fields to work, configure a real static OAuth client in the server first:
 
@@ -151,7 +163,7 @@ curl -X POST https://lightcap.ai/oauth/token \
   }'
 ```
 
-The gateway validates by connecting to your server via SSH. Once authenticated, all 156 MCP tools operate on YOUR server through the Lightcap gateway. Full audit logging, rate limiting, and connection pooling included.
+The gateway validates by connecting to your server via SSH. Once authenticated, all 163 MCP tools operate on YOUR server through the Lightcap gateway. Full audit logging, rate limiting, and connection pooling included.
 
 ```mermaid
 flowchart LR
@@ -222,7 +234,7 @@ flowchart LR
 |---|---|---|
 | **Hosted gateway** | Install-only | Use `lightcap.ai/mcp/nexus` instantly — zero setup |
 | **Memory** | Stateless — every session starts from zero | Remembers your sessions, preferences, and workflows |
-| **Scope** | Single-purpose (just files, just git) | 156 tools covering the full DevOps stack |
+| **Scope** | Single-purpose (just files, just git) | 163 tools covering the full DevOps stack |
 | **Debugging** | None | Lint, typecheck, syntax check, error search, symbol finder |
 | **Connection** | Spawns new processes per call | Pooled SSH connections with auto-reconnect |
 | **Recovery** | You notice when things break | Watchdog auto-restarts crashed services |
@@ -418,7 +430,7 @@ These behaviors are identical in hosted and self-host mode because they run agai
 
 ## Tools
 
-MCP Nexus currently exposes **156 tools** across execution, infrastructure, deployment, intelligence, and audit layers.
+MCP Nexus currently exposes **163 tools** across execution, infrastructure, deployment, intelligence, audit, and host-side data analysis layers.
 
 ### Filesystem (20 tools)
 
@@ -432,7 +444,7 @@ MCP Nexus currently exposes **156 tools** across execution, infrastructure, depl
 | `move_file`, `delete_file`, `create_directory` | Perform filesystem mutations with safety guards |
 | `chmod_file`, `chown_file` | Adjust permissions and ownership |
 
-### Terminal & Runtime (10 tools)
+### Terminal & Runtime (11 tools)
 
 | Tools | Description |
 |------|-------------|
@@ -440,6 +452,7 @@ MCP Nexus currently exposes **156 tools** across execution, infrastructure, depl
 | `execute_script` | Multi-line script execution through any interpreter |
 | `execute_batch` | Execute a sequence of commands with shared limits, dry-run preview, and per-step results |
 | `execute_python` | Direct Python execution with optional reusable virtualenv sandbox |
+| `execute_python_file` | Execute an existing Python file with optional sandboxed dependencies and structured database URI injection |
 | `server_capabilities`, `environment_info`, `which_command` | Inspect runtime defaults, detected backends, and binary availability |
 | `create_python_sandbox`, `list_python_sandboxes`, `remove_python_sandbox` | Lifecycle management for reusable Python sandboxes on the target host |
 
@@ -474,16 +487,19 @@ MCP Nexus currently exposes **156 tools** across execution, infrastructure, depl
 | `cron_list`, `cron_add` | Crontab management |
 | `docker_compose_ps`, `docker_compose_logs` | Compose-level service and log inspection |
 
-### Database (18 tools)
+### Database (22 tools)
 
 | Tools | Description |
 |------|-------------|
+| `db_client_status` | Inspect target-side database client readiness: `psql`, Python driver imports, selected sandbox, and raw TCP reachability |
+| `db_client_bootstrap` | Prepare a reusable database client sandbox with modern `psycopg` support and ensure `psql` is available on the target |
 | `db_profiles`, `db_use` | List named database profiles and bind the current MCP session to one without exposing secrets |
-| `db_query`, `db_safe_query`, `db_execute` | Query with optional row limiting, enforce read-only transactions, or run unrestricted statements |
+| `inspect_database` | Inspect a PostgreSQL target from a named profile or a PostgreSQL URI without relying on Python DB drivers |
+| `db_query`, `db_safe_query`, `db_execute` | Run SQL from either a named profile or a direct PostgreSQL URI, with optional `sql` aliases and server-enforced read-only query mode |
 | `db_explain`, `db_query_explain` | Inspect execution plans with explicit EXPLAIN tooling |
-| `db_tables`, `db_schema`, `db_indexes`, `db_sample` | Explore schema, index layout, and sample rows with safe identifier quoting |
+| `db_tables`, `db_schema`, `db_table_inspect`, `db_indexes`, `db_sample` | Explore schema, index layout, compact table snapshots, and sample rows with safe identifier quoting |
 | `db_profile`, `db_join_suggest` | Profile tables from PostgreSQL statistics and surface likely join candidates |
-| `db_export_csv` | Write query output to a CSV artifact in one step |
+| `db_export_csv` | Write query output to a CSV artifact or a stable output path in one step |
 | `db_size`, `db_connections`, `db_table_stats`, `db_extensions` | Operational database visibility and extension inventory |
 
 ### Monitoring (10 tools)
@@ -523,6 +539,13 @@ MCP Nexus currently exposes **156 tools** across execution, infrastructure, depl
 | `pip_list`, `pip_show`, `python_virtualenvs` | Python package and virtualenv inspection |
 | `npm_list`, `npm_install` | Node package inspection and installation |
 
+### Analysis (2 tools)
+
+| Tools | Description |
+|------|-------------|
+| `tabular_dataset_profile` | Profile a CSV file or SQL result into a model-oriented dataset summary without shipping raw Python in tool args |
+| `train_tabular_classifier` | Train a general tabular classifier from CSV or SQL using a managed Python sandbox and return a structured evaluation report |
+
 ### Intelligence (6 tools)
 
 | Tools | Description |
@@ -546,7 +569,7 @@ flowchart TB
     Gateway --> Middleware["Auth + Rate Limit + Request Trace"]
     Middleware --> Registry["Stable Registry<br/>server_instance_id + registry_version"]
     Middleware --> Sessions["Session Store<br/>live binding + active DB profile"]
-    Registry --> Tools["Tool Catalog (156 tools)"]
+    Registry --> Tools["Tool Catalog (163 tools)"]
     Sessions --> Tools
     Tools --> Runtime["Capability Probe + Managed Execution + Python Sandbox"]
     Tools --> Jobs["Detached Job Layer<br/>run/wait/log/status"]
@@ -583,6 +606,8 @@ flowchart TB
 
 When `NEXUS_SSH_HOST` is `127.0.0.1`, `localhost`, or another local interface, Nexus skips SSH entirely and executes locally. This makes CI, laptop workflows, and single-node deployments simpler without changing the tool surface.
 
+When Nexus itself runs inside Docker, that assumption changes: container `localhost` is the container, not the host machine. Nexus now treats loopback targets as host-bridge targets by default in containerized deployments so `localhost`-scoped SSH and database profiles keep pointing at the intended host instead of the container namespace.
+
 ---
 
 ## Configuration
@@ -618,6 +643,9 @@ All configuration is environment-driven. Host capability detection supplies the 
 | `NEXUS_ARTIFACT_ROOT` | `~/.mcp-nexus/artifacts` | Local artifact directory for oversized stdout/stderr/CSV exports |
 | `NEXUS_TOOL_ALIAS_BASE` | `/mcp-nexus` | Stable HTTP-style alias prefix attached to every tool |
 | `NEXUS_FORWARDED_HEADERS` | `forwarded,x-forwarded-for,x-forwarded-host,x-forwarded-port,x-forwarded-proto` | Forwarded headers copied into request/session metadata |
+| `NEXUS_RUNNING_IN_CONTAINER` | auto-detect | Force container-runtime detection when localhost should not mean host-local execution |
+| `NEXUS_HOST_BRIDGE_ADDRESS` | auto-detect | Host bridge address used when containerized Nexus must reach host-local services such as SSH or PostgreSQL |
+| `NEXUS_ALLOW_CONTAINER_LOCALHOST_EXEC` | `false` | Re-enable container-local execution if you intentionally want `localhost` to mean the container itself |
 
 ### Intelligence & Audit
 
@@ -654,6 +682,8 @@ These paths are evaluated on the **connected target host**, not expanded on the 
 | `NEXUS_OAUTH_REFRESH_TTL_SECONDS` | `2592000` | Refresh token lifetime |
 | `NEXUS_OAUTH_AUTHORIZATION_CODE_TTL_SECONDS` | `600` | Authorization code lifetime |
 | `NEXUS_OAUTH_CONSENT_PATH` | `/oauth/consent` | Consent UI path used during ChatGPT Connect |
+| `NEXUS_STATE_ROOT` | `~/.mcp-nexus/state` | Persistent encrypted state for OAuth clients, bindings, access tokens, and refresh tokens |
+| `NEXUS_STATE_ENCRYPTION_KEY` | auto-generated | Optional Fernet key used to encrypt the persisted state file |
 | `NEXUS_RATE_LIMIT_RPM` | `120` | Requests per minute |
 | `NEXUS_RATE_LIMIT_BURST` | `20` | Burst capacity |
 
@@ -661,10 +691,23 @@ These paths are evaluated on the **connected target host**, not expanded on the 
 
 Use named profiles when you do not want agents to ever see raw credentials in tool arguments. Legacy `NEXUS_DB_*` variables still work and are mapped into the default profile for backward compatibility.
 
+When Nexus executes database commands locally from inside Docker and a database profile points at `localhost`, Nexus resolves that loopback target through the host bridge instead of the container namespace. SSH-backed sessions keep `localhost` unchanged, because `psql` runs on the remote target host rather than inside the Nexus container.
+
+If you provide a PostgreSQL URI, it must be standards-compliant. Passwords containing reserved characters such as `#` must be URL-encoded, otherwise the URI is malformed before Nexus can parse it.
+
+If an agent needs Python-side database libraries for follow-up work, use `db_client_bootstrap` first and pass the returned sandbox path into `execute_python.sandbox_path`. That keeps driver installs isolated from the system interpreter and avoids ad-hoc `pip install` shell sequences.
+
+If your MCP client is sensitive to raw shell payloads, prefer structured workflows:
+
+- Use `db_profiles` / `db_use` or a `database` URI argument instead of embedding credentials into shell strings.
+- Use `db_export_csv(output_path=...)` to materialize a stable dataset file on the host.
+- Use `execute_python_file` for existing scripts and `train_tabular_classifier` for ad-hoc model evaluation instead of inline heredoc Python.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NEXUS_DB_PROFILES_JSON` | | JSON object of named PostgreSQL profiles consumed by `db_profiles` / `db_use` |
 | `NEXUS_DB_DEFAULT_PROFILE` | `default` | Default profile when no session-bound profile is active |
+| `NEXUS_DB_DSN` | | Single PostgreSQL URI alternative to the legacy `NEXUS_DB_*` fields |
 | `NEXUS_DB_HOST` | | PostgreSQL host |
 | `NEXUS_DB_PORT` | `5432` | PostgreSQL port |
 | `NEXUS_DB_NAME` | | Database name |
@@ -690,6 +733,11 @@ Use named profiles when you do not want agents to ever see raw credentials in to
 ```bash
 docker compose up -d
 ```
+
+The bundled compose file now does two extra things on purpose:
+
+1. Persists `~/.mcp-nexus` so OAuth clients, bindings, refresh tokens, and access tokens survive container restarts.
+2. Injects `host.docker.internal` via `host-gateway` so loopback SSH/database targets can resolve back to the host machine instead of the container itself.
 
 ### Systemd
 
@@ -879,8 +927,12 @@ ChatGPT should discover the rest automatically from the well-known OAuth metadat
 
 If a manual OAuth form appears, use:
 
+- MCP URL: `https://lightcap.ai/mcp/nexus`
 - Auth URL: `https://lightcap.ai/authorize`
 - Token URL: `https://lightcap.ai/token`
+- Registration URL: `https://lightcap.ai/register`
+- Authorization server base: `https://lightcap.ai`
+- Resource: `https://lightcap.ai/mcp/nexus`
 - Client ID: `nexus-lightcap-prod`
 - Client Secret: `nxs_sec_9f78f08ec360-lc2026`
 - Scope: `nexus` or blank
@@ -896,6 +948,8 @@ Those values belong to the legacy machine-to-machine flow below, not the ChatGPT
 If ChatGPT opens `/authorize` with a URL that does not include `code_challenge=...`, you are still using an old manual OAuth configuration. Remove that connector and add MCP Nexus again from the MCP URL only.
 
 If ChatGPT returns `Client ID '...' not found`, that is an OAuth client registration problem, not an SSH host or localhost problem. It means the value in the ChatGPT OAuth form does not match a configured static OAuth client on the server.
+
+If the connector redirects you to `https://lightcap.ai/...`, that is the correct consent step. Enter the real SSH target there. Do not enter your server IP into OAuth `client_id`, and do not enter your SSH password into OAuth `client_secret`.
 
 For the Lightcap-hosted gateway, the standard shared manual client is:
 
@@ -929,6 +983,7 @@ When running MCP Nexus privately on your own machine, disable public OAuth by om
 ## Troubleshooting
 
 - If ChatGPT Connect opens a website page, 403, or 404 instead of MCP Nexus, your same-origin proxy is incomplete. Make sure `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/...`, `/authorize`, `/token`, `/register`, `/oauth/consent`, and `/mcp/nexus` all reach MCP Nexus on the same public origin.
+- If Cloudflare or another edge firewall returns `403` / `1010` on `/mcp/nexus` or the OAuth discovery paths while the origin works directly, exclude the MCP and OAuth routes from browser-signature or bot-fight rules. ChatGPT and other MCP clients are not guaranteed to look like a normal browser.
 - If `git_diagnose` or `compare_paths` returns `GIT_UNAVAILABLE`, install `git` on the target host. `compare_paths` uses Git's `--no-index` diff engine so it can produce structured rename and summary output.
 - If `compare_paths` says a path is missing, verify both path arguments on the target host, not the MCP client.
 - If `execute_batch` stops after the first failure, that is by design when `stop_on_error=true`. Set it to `false` if you want the remaining commands to run and inspect each step's `error_code`.

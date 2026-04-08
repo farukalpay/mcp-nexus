@@ -16,7 +16,9 @@ COPY mcp_nexus/ mcp_nexus/
 RUN pip install --no-cache-dir .
 
 # Non-root user
-RUN useradd -m nexus
+RUN useradd -m nexus \
+    && mkdir -p /home/nexus/.mcp-nexus \
+    && chown -R nexus:nexus /home/nexus
 USER nexus
 
 EXPOSE 8766

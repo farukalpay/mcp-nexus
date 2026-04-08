@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 from dotenv import load_dotenv
 
@@ -32,6 +34,13 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return v in ("1", "true", "yes") if v else default
 
 
+def _env_bool_or_none(key: str) -> bool | None:
+    v = os.getenv(key)
+    if v is None or not v.strip():
+        return None
+    return v.lower() in ("1", "true", "yes")
+
+
 def _env_list(key: str, default: str = "") -> list[str]:
     v = os.getenv(key, default)
     return [s.strip() for s in v.split(",") if s.strip()] if v else []
@@ -45,6 +54,96 @@ def _join_url(base: str, path: str) -> str:
     return f"{normalized_base}{normalized_path}"
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+WILDCARD_BIND_HOSTS = {"0.0.0.0", "::"}
+
+
+def _host_is_loopback(host: str) -> bool:
+    return host.strip().lower() in LOOPBACK_HOSTS
+
+
+def _append_unique(values: list[str], candidate: str) -> None:
+    if candidate and candidate not in values:
+        values.append(candidate)
+
+
+def _host_literal(host: str) -> str:
+    candidate = host.strip().lower()
+    if ":" in candidate and not candidate.startswith("["):
+        return f"[{candidate}]"
+    return candidate
+
+
+def _origin_components(value: str) -> tuple[list[str], list[str]]:
+    candidate = value.strip()
+    if not candidate:
+        return [], []
+
+    parsed = urlsplit(candidate)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return [], []
+
+    host = _host_literal(parsed.hostname)
+    hosts = [host, f"{host}:*"]
+    origins = [f"{parsed.scheme.lower()}://{host}", f"{parsed.scheme.lower()}://{host}:*"]
+    if parsed.port is not None:
+        _append_unique(hosts, f"{host}:{parsed.port}")
+        _append_unique(origins, f"{parsed.scheme.lower()}://{host}:{parsed.port}")
+    return hosts, origins
+
+
+def _detect_container_runtime() -> bool:
+    override = _env_bool_or_none("NEXUS_RUNNING_IN_CONTAINER")
+    if override is not None:
+        return override
+
+    if Path("/.dockerenv").exists():
+        return True
+
+    for candidate in ("/proc/1/cgroup", "/proc/self/cgroup"):
+        try:
+            content = Path(candidate).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        lowered = content.lower()
+        if any(marker in lowered for marker in ("docker", "containerd", "kubepods", "podman")):
+            return True
+    return False
+
+
+def _resolve_container_host_bridge() -> str:
+    explicit = _env("NEXUS_HOST_BRIDGE_ADDRESS", "").strip()
+    if explicit:
+        return explicit
+
+    try:
+        socket.gethostbyname("host.docker.internal")
+    except OSError:
+        pass
+    else:
+        return "host.docker.internal"
+
+    route_path = Path("/proc/net/route")
+    if not route_path.exists():
+        return ""
+
+    try:
+        lines = route_path.read_text(encoding="utf-8").splitlines()[1:]
+    except OSError:
+        return ""
+
+    for line in lines:
+        columns = line.split()
+        if len(columns) < 3 or columns[1] != "00000000":
+            continue
+        gateway_hex = columns[2]
+        try:
+            return socket.inet_ntoa(bytes.fromhex(gateway_hex)[::-1])
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
 @dataclass(frozen=True)
 class DatabaseProfile:
     """Named PostgreSQL connection profile resolved from the environment."""
@@ -55,25 +154,83 @@ class DatabaseProfile:
     database: str
     user: str
     password: str
+    connect_host: str = ""
     sslmode: str = ""
+
+    def with_connect_host(self, connect_host: str) -> DatabaseProfile:
+        return DatabaseProfile(
+            name=self.name,
+            host=self.host,
+            port=self.port,
+            database=self.database,
+            user=self.user,
+            password=self.password,
+            connect_host=connect_host,
+            sslmode=self.sslmode,
+        )
 
     @property
     def dsn(self) -> str:
-        base = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+        target_host = self.connect_host or self.host
+        encoded_user = quote(self.user, safe="")
+        encoded_password = quote(self.password, safe="")
+        encoded_database = quote(self.database, safe="")
+        base = f"postgresql://{encoded_user}:{encoded_password}@{target_host}:{self.port}/{encoded_database}"
         if self.sslmode:
-            return f"{base}?sslmode={self.sslmode}"
+            return f"{base}?{urlencode({'sslmode': self.sslmode})}"
         return base
 
     def redacted(self) -> dict[str, object]:
         return {
             "name": self.name,
             "host": self.host,
+            "connect_host": (self.connect_host or None) if self.connect_host != self.host else None,
             "port": self.port,
             "database": self.database,
             "user": self.user,
             "sslmode": self.sslmode or None,
             "has_password": bool(self.password),
         }
+
+
+def parse_postgres_dsn(
+    value: str,
+    *,
+    name: str,
+    resolve_connect_host: Callable[[str], str] | None = None,
+) -> DatabaseProfile:
+    candidate = value.strip()
+    if not candidate:
+        raise ValueError("Database URI is required.")
+
+    parsed = urlsplit(candidate)
+    if parsed.scheme.lower() not in {"postgresql", "postgres"}:
+        raise ValueError("Database URI must start with postgresql:// or postgres://.")
+    if parsed.fragment:
+        raise ValueError(
+            "Database URI must not contain a fragment. If the password contains '#', URL-encode it as %23."
+        )
+    if not parsed.hostname:
+        raise ValueError("Database URI must include a hostname.")
+    if parsed.username is None:
+        raise ValueError("Database URI must include a username.")
+
+    database_name = parsed.path.lstrip("/")
+    if not database_name:
+        raise ValueError("Database URI must include a database name.")
+
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    host = parsed.hostname
+    return DatabaseProfile(
+        name=name,
+        host=host,
+        port=parsed.port or 5432,
+        database=unquote(database_name),
+        user=unquote(parsed.username),
+        password=unquote(parsed.password or ""),
+        connect_host=resolve_connect_host(host) if resolve_connect_host else host,
+        sslmode=query.get("sslmode", [""])[-1],
+    )
 
 
 @dataclass
@@ -97,6 +254,13 @@ class Settings:
     oauth_issuer: str = field(default_factory=lambda: _env("NEXUS_OAUTH_ISSUER", ""))
     oauth_enabled: bool = field(default_factory=lambda: _env_bool("NEXUS_OAUTH_ENABLED", True))
     public_base_url: str = field(default_factory=lambda: _env("NEXUS_PUBLIC_BASE_URL", ""))
+    runtime_container: bool = field(default_factory=_detect_container_runtime)
+    allow_container_localhost_exec: bool = field(
+        default_factory=lambda: _env_bool("NEXUS_ALLOW_CONTAINER_LOCALHOST_EXEC", False)
+    )
+    host_bridge_address: str = field(default_factory=_resolve_container_host_bridge)
+    state_root: str = field(default_factory=lambda: _env("NEXUS_STATE_ROOT", "~/.mcp-nexus/state"))
+    state_encryption_key: str = field(default_factory=lambda: _env("NEXUS_STATE_ENCRYPTION_KEY", ""))
     oauth_scopes: list[str] = field(default_factory=lambda: _env_list("NEXUS_OAUTH_SCOPES", "nexus"))
     oauth_default_scopes: list[str] = field(default_factory=lambda: _env_list("NEXUS_OAUTH_DEFAULT_SCOPES", "nexus"))
     oauth_token_ttl_seconds: int = field(default_factory=lambda: _env_int("NEXUS_OAUTH_TOKEN_TTL_SECONDS", 3600))
@@ -140,6 +304,7 @@ class Settings:
 
     # Database (optional)
     db_host: str = field(default_factory=lambda: _env("NEXUS_DB_HOST", ""))
+    db_dsn_value: str = field(default_factory=lambda: _env("NEXUS_DB_DSN", ""))
     db_port: int = field(default_factory=lambda: _env_int("NEXUS_DB_PORT", 5432))
     db_name: str = field(default_factory=lambda: _env("NEXUS_DB_NAME", ""))
     db_user: str = field(default_factory=lambda: _env("NEXUS_DB_USER", ""))
@@ -164,16 +329,67 @@ class Settings:
 
     @property
     def is_localhost(self) -> bool:
-        """Detect if the target server is the same machine (skip SSH)."""
-        host = self.ssh_host
-        if host in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
+        """Detect if the target host can be executed directly from this runtime."""
+        return self.is_local_execution_host(self.ssh_host)
+
+    @property
+    def resolved_ssh_host(self) -> str:
+        return self.resolve_connect_host(self.ssh_host)
+
+    def is_local_execution_host(self, host: str) -> bool:
+        candidate = host.strip()
+        if not candidate:
+            return False
+        if self.runtime_container and not self.allow_container_localhost_exec:
+            return False
+        if _host_is_loopback(candidate):
             return True
+        if self.runtime_container:
+            return False
         try:
             local_ips = {addr[4][0] for info in socket.getaddrinfo(socket.gethostname(), None) for addr in [info]}
             local_ips.add("127.0.0.1")
-            return host in local_ips
+            return candidate in local_ips
         except Exception:
             return False
+
+    def resolve_connect_host(self, host: str) -> str:
+        candidate = host.strip()
+        if not candidate:
+            return candidate
+        if self.runtime_container and not self.allow_container_localhost_exec and _host_is_loopback(candidate):
+            return self.host_bridge_address or candidate
+        return candidate
+
+    def resolve_database_connect_host(self, host: str, *, execution_backend: str) -> str:
+        candidate = host.strip()
+        if not candidate:
+            return candidate
+        if execution_backend == "local":
+            return self.resolve_connect_host(candidate)
+        return candidate
+
+    def materialize_db_profile(self, profile: DatabaseProfile, *, execution_backend: str) -> DatabaseProfile:
+        return profile.with_connect_host(
+            self.resolve_database_connect_host(profile.host, execution_backend=execution_backend)
+        )
+
+    def resolve_requested_db_profile(
+        self,
+        *,
+        profile_name: str = "",
+        database: str = "",
+        execution_backend: str = "",
+    ) -> DatabaseProfile | None:
+        if database.strip():
+            profile = parse_postgres_dsn(database, name=profile_name.strip() or "adhoc")
+        else:
+            profile = self.resolve_db_profile(profile_name)
+            if profile is None:
+                return None
+        if execution_backend:
+            return self.materialize_db_profile(profile, execution_backend=execution_backend)
+        return profile
 
     @property
     def db_dsn(self) -> str:
@@ -217,6 +433,42 @@ class Settings:
     def oauth_static_client_enabled(self) -> bool:
         return bool(self.oauth_enabled and self.oauth_client_id and self.oauth_client_redirect_uris)
 
+    @property
+    def transport_allowed_hosts(self) -> list[str]:
+        allowed: list[str] = []
+
+        bind_host = self.host.strip().lower()
+        if bind_host in {"127.0.0.1", "localhost", "::1"}:
+            for candidate in ("127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*", "[::1]", "[::1]:*"):
+                _append_unique(allowed, candidate)
+        elif bind_host and bind_host not in WILDCARD_BIND_HOSTS:
+            literal = _host_literal(bind_host)
+            _append_unique(allowed, literal)
+            _append_unique(allowed, f"{literal}:*")
+
+        for value in (self.public_base_url, self.oauth_issuer):
+            hosts, _ = _origin_components(value)
+            for candidate in hosts:
+                _append_unique(allowed, candidate)
+
+        return allowed
+
+    @property
+    def transport_allowed_origins(self) -> list[str]:
+        allowed: list[str] = []
+
+        bind_host = self.host.strip().lower()
+        if bind_host in {"127.0.0.1", "localhost", "::1"}:
+            for candidate in ("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"):
+                _append_unique(allowed, candidate)
+
+        for value in (self.public_base_url, self.oauth_issuer, *self.oauth_client_redirect_uris):
+            _, origins = _origin_components(value)
+            for candidate in origins:
+                _append_unique(allowed, candidate)
+
+        return allowed
+
     def expanded_path(self, value: str) -> str:
         return str(Path(value).expanduser()) if value else value
 
@@ -228,19 +480,43 @@ class Settings:
             if not isinstance(raw_profiles, dict):
                 raise ValueError("NEXUS_DB_PROFILES_JSON must be a JSON object keyed by profile name")
             for name, payload in raw_profiles.items():
+                if isinstance(payload, str):
+                    profiles[name] = parse_postgres_dsn(
+                        payload,
+                        name=name,
+                    )
+                    continue
                 if not isinstance(payload, dict):
-                    raise ValueError(f"Database profile {name!r} must be a JSON object")
+                    raise ValueError(f"Database profile {name!r} must be a JSON object or PostgreSQL URI string")
+                dsn_value = str(payload.get("dsn") or payload.get("uri") or payload.get("url") or "").strip()
+                if dsn_value:
+                    profiles[name] = parse_postgres_dsn(
+                        dsn_value,
+                        name=name,
+                    )
+                    continue
+                host = str(payload.get("host", ""))
                 profiles[name] = DatabaseProfile(
                     name=name,
-                    host=str(payload.get("host", "")),
+                    host=host,
                     port=int(payload.get("port", 5432)),
                     database=str(payload.get("database") or payload.get("dbname") or payload.get("name") or ""),
                     user=str(payload.get("user", "")),
                     password=str(payload.get("password", "")),
+                    connect_host=host,
                     sslmode=str(payload.get("sslmode", "")),
                 )
 
-        if self.db_host:
+        if self.db_dsn_value:
+            legacy_name = self.db_default_profile or ("default" if not profiles else "legacy")
+            profiles.setdefault(
+                legacy_name,
+                parse_postgres_dsn(
+                    self.db_dsn_value,
+                    name=legacy_name,
+                ),
+            )
+        elif self.db_host:
             legacy_name = self.db_default_profile or ("default" if not profiles else "legacy")
             profiles.setdefault(
                 legacy_name,
@@ -251,6 +527,7 @@ class Settings:
                     database=self.db_name,
                     user=self.db_user,
                     password=self.db_password,
+                    connect_host=self.db_host,
                     sslmode=self.db_sslmode,
                 ),
             )

@@ -10,6 +10,13 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from mcp_nexus.python_sandbox import (
+    ensure_python_sandbox,
+    sandbox_root,
+)
+from mcp_nexus.python_sandbox import (
+    sandbox_path as build_sandbox_path,
+)
 from mcp_nexus.results import ToolResult, build_tool_result, preview_text
 from mcp_nexus.runtime import ExecutionLimits, ExecutionRequest, build_managed_command, extract_execution_metadata
 from mcp_nexus.server import get_artifacts, get_pool, get_settings, tool_context
@@ -18,19 +25,26 @@ from mcp_nexus.transport.ssh import CommandResult
 
 def _safe_cwd(cwd: str) -> str:
     settings = get_settings()
-    return cwd or settings.default_cwd
+    return settings.expanded_path(cwd or settings.default_cwd)
 
 
-def _sandbox_root() -> str:
-    settings = get_settings()
-    return settings.sandbox_root
+def _unique_heredoc_marker(script: str, *, prefix: str) -> str:
+    marker = prefix
+    counter = 0
+    while marker in script:
+        counter += 1
+        marker = f"{prefix}_{counter}"
+    return marker
 
 
-def _sandbox_path(name: str = "", path: str = "") -> str:
-    if path:
-        return path
-    suffix = name or f"python-{int(time.time())}"
-    return str(PurePosixPath(_sandbox_root()) / suffix)
+def _stdin_script_command(interpreter: str, script: str, *, stdin_flag: str = "") -> str:
+    marker = _unique_heredoc_marker(script, prefix="NEXUS_SCRIPT_EOF")
+    stdin_suffix = f" {stdin_flag}" if stdin_flag else ""
+    return f"{shlex.quote(interpreter)}{stdin_suffix} <<'{marker}'\n{script}\n{marker}"
+
+
+def _argv_command(program: str, args: list[str] | None = None) -> str:
+    return " ".join([shlex.quote(program), *(shlex.quote(arg) for arg in (args or []))])
 
 
 def _error_code_for_result(result: CommandResult) -> tuple[str | None, str | None]:
@@ -197,52 +211,51 @@ def _result(
     )
 
 
-async def _ensure_python_sandbox(
+async def _resolve_database_env(
+    tool_name: str,
     *,
-    sandbox_path: str,
-    requirements: list[str] | None = None,
-    recreate: bool = False,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    pool = get_pool()
-    conn = await pool.acquire()
+    started: float,
+    database_profile: str = "",
+    database: str = "",
+    db_env_var: str = "",
+) -> tuple[dict[str, str] | None, ToolResult | None]:
+    wants_db_env = bool(database_profile.strip() or database.strip() or db_env_var.strip())
+    if not wants_db_env:
+        return {}, None
+
+    settings = get_settings()
+    profile_name = database_profile.strip()
     try:
-        capabilities = await conn.probe_capabilities()
-        if not capabilities.python_command:
-            raise RuntimeError("Python is not available on the target host")
-
-        sandbox = _sandbox_path(path=sandbox_path)
-        base_dir = str(PurePosixPath(sandbox).parent)
-        if recreate:
-            await conn.run_full(f"rm -rf {shlex.quote(sandbox)}")
-
-        exists = await conn.file_exists(f"{sandbox}/pyvenv.cfg")
-        if not exists:
-            cmd = (
-                f"mkdir -p {shlex.quote(base_dir)} && "
-                f"{shlex.quote(capabilities.python_command)} -m venv {shlex.quote(sandbox)} && "
-                f"{shlex.quote(sandbox)}/bin/python -m pip install --upgrade pip"
-            )
-            result = await conn.run_full(cmd, timeout=180)
-            if not result.ok:
-                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "sandbox creation failed")
-
-        if requirements:
-            packages = " ".join(shlex.quote(req) for req in requirements)
-            install = await conn.run_full(f"{shlex.quote(sandbox)}/bin/pip install {packages}", timeout=240)
-            if not install.ok:
-                raise RuntimeError(install.stderr.strip() or install.stdout.strip() or "sandbox install failed")
-
-        return (
-            {
-                "path": sandbox,
-                "python": f"{sandbox}/bin/python",
-                "pip": f"{sandbox}/bin/pip",
-                "requirements": requirements or [],
-            },
-            capabilities.to_dict(),
+        resolved = settings.resolve_requested_db_profile(
+            profile_name=profile_name,
+            database=database,
+            execution_backend=str(get_pool().backend_metadata()["backend_kind"]),
         )
-    finally:
-        pool.release(conn)
+    except ValueError as exc:
+        return None, _result(
+            tool_name,
+            ok=False,
+            duration_ms=(time.monotonic() - started) * 1000,
+            error_code="INVALID_DATABASE_URI",
+            error_stage="validation",
+            message=str(exc),
+        )
+
+    if resolved is None:
+        return None, _result(
+            tool_name,
+            ok=False,
+            duration_ms=(time.monotonic() - started) * 1000,
+            error_code="DB_PROFILE_NOT_FOUND" if profile_name else "DB_PROFILE_NOT_CONFIGURED",
+            error_stage="configuration",
+            message=(
+                f"Database profile {profile_name!r} was not found."
+                if profile_name
+                else "No database profile is configured. Set NEXUS_DB_PROFILES_JSON or pass a database URI."
+            ),
+        )
+
+    return {db_env_var.strip() or "NEXUS_DB_URI": resolved.dsn}, None
 
 
 def register(mcp: FastMCP):
@@ -253,6 +266,9 @@ def register(mcp: FastMCP):
         cwd: str = "",
         timeout: int = 60,
         env: dict[str, str] | None = None,
+        database_profile: str = "",
+        database: str = "",
+        db_env_var: str = "",
         capture_usage: bool = True,
         cpu_limit_sec: int = 0,
         memory_limit_mb: int = 0,
@@ -261,12 +277,21 @@ def register(mcp: FastMCP):
     ) -> ToolResult:
         """Execute a shell command with structured stdout/stderr and artifact fallbacks."""
         started = time.monotonic()
+        database_env, env_error = await _resolve_database_env(
+            "execute_command",
+            started=started,
+            database_profile=database_profile,
+            database=database,
+            db_env_var=db_env_var,
+        )
+        if env_error:
+            return env_error
         try:
             result, usage, capabilities, duration_ms = await _run_execution(
                 command=command,
                 cwd=cwd,
                 timeout=timeout,
-                env=env,
+                env={**(env or {}), **(database_env or {})},
                 capture_usage=capture_usage,
                 cpu_limit_sec=cpu_limit_sec,
                 memory_limit_mb=memory_limit_mb,
@@ -305,6 +330,9 @@ def register(mcp: FastMCP):
         cwd: str = "",
         timeout: int = 60,
         env: dict[str, str] | None = None,
+        database_profile: str = "",
+        database: str = "",
+        db_env_var: str = "",
         capture_usage: bool = True,
         stop_on_error: bool = True,
         dry_run: bool = False,
@@ -338,7 +366,16 @@ def register(mcp: FastMCP):
             )
 
         timeout = min(timeout or settings.default_command_timeout, 600)
-        env = env or {}
+        database_env, env_error = await _resolve_database_env(
+            "execute_batch",
+            started=started,
+            database_profile=database_profile,
+            database=database,
+            db_env_var=db_env_var,
+        )
+        if env_error:
+            return env_error
+        env = {**(env or {}), **(database_env or {})}
         planned_commands = [
             {
                 "index": index,
@@ -540,23 +577,31 @@ def register(mcp: FastMCP):
         cwd: str = "",
         timeout: int = 120,
         env: dict[str, str] | None = None,
+        database_profile: str = "",
+        database: str = "",
+        db_env_var: str = "",
         capture_usage: bool = True,
         cpu_limit_sec: int = 0,
         memory_limit_mb: int = 0,
     ) -> ToolResult:
         """Execute a multi-line script through the chosen interpreter."""
-        temp_path = "/tmp/_nexus_script_$$"
-        command = (
-            f"cat > {temp_path} << 'NEXUS_SCRIPT_EOF'\n{script}\nNEXUS_SCRIPT_EOF\n"
-            f"{shlex.quote(interpreter)} {temp_path}; _rc=$?; rm -f {temp_path}; exit $_rc"
-        )
+        command = _stdin_script_command(interpreter, script)
         started = time.monotonic()
+        database_env, env_error = await _resolve_database_env(
+            "execute_script",
+            started=started,
+            database_profile=database_profile,
+            database=database,
+            db_env_var=db_env_var,
+        )
+        if env_error:
+            return env_error
         try:
             result, usage, capabilities, duration_ms = await _run_execution(
                 command=command,
                 cwd=cwd,
                 timeout=timeout,
-                env=env,
+                env={**(env or {}), **(database_env or {})},
                 capture_usage=capture_usage,
                 cpu_limit_sec=cpu_limit_sec,
                 memory_limit_mb=memory_limit_mb,
@@ -596,15 +641,28 @@ def register(mcp: FastMCP):
         sandbox_path: str = "",
         requirements: list[str] | None = None,
         env: dict[str, str] | None = None,
+        database_profile: str = "",
+        database: str = "",
+        db_env_var: str = "",
         capture_usage: bool = True,
         cpu_limit_sec: int = 60,
         memory_limit_mb: int = 512,
     ) -> ToolResult:
-        """Execute Python code directly or inside a reusable virtualenv sandbox."""
+        """Execute Python code on the connected target without embedding raw credentials in the code."""
         runtime_env = dict(env or {})
         sandbox_info: dict[str, Any] | None = None
         python_bin = "python3"
         started = time.monotonic()
+        database_env, env_error = await _resolve_database_env(
+            "execute_python",
+            started=started,
+            database_profile=database_profile,
+            database=database,
+            db_env_var=db_env_var,
+        )
+        if env_error:
+            return env_error
+        runtime_env.update(database_env or {})
 
         pool = get_pool()
         conn = await pool.acquire()
@@ -627,8 +685,8 @@ def register(mcp: FastMCP):
 
         try:
             if sandbox_path or requirements:
-                sandbox_info, _ = await _ensure_python_sandbox(
-                    sandbox_path=sandbox_path or _sandbox_path(),
+                sandbox_info, _ = await ensure_python_sandbox(
+                    sandbox_path_value=sandbox_path or build_sandbox_path(name="python"),
                     requirements=requirements,
                 )
                 python_bin = str(sandbox_info["python"])
@@ -636,11 +694,7 @@ def register(mcp: FastMCP):
                 runtime_env["VIRTUAL_ENV"] = sandbox_root
                 runtime_env["PATH"] = f"{sandbox_root}/bin:$PATH"
 
-            temp_path = "/tmp/_nexus_python_$$.py"
-            command = (
-                f"cat > {temp_path} << 'NEXUS_PYTHON_EOF'\n{code}\nNEXUS_PYTHON_EOF\n"
-                f"{shlex.quote(python_bin)} {temp_path}; _rc=$?; rm -f {temp_path}; exit $_rc"
-            )
+            command = _stdin_script_command(python_bin, code, stdin_flag="-")
             result, usage, capability_data, duration_ms = await _run_execution(
                 command=command,
                 cwd=cwd,
@@ -677,6 +731,119 @@ def register(mcp: FastMCP):
                 "capabilities": capability_data,
                 "sandbox": sandbox_info,
                 "cwd": _safe_cwd(cwd) or None,
+            },
+            usage=usage,
+        )
+
+    @mcp.tool(structured_output=True)
+    async def execute_python_file(
+        path: str,
+        args: list[str] | None = None,
+        cwd: str = "",
+        timeout: int = 120,
+        sandbox_path: str = "",
+        requirements: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        database_profile: str = "",
+        database: str = "",
+        db_env_var: str = "",
+        capture_usage: bool = True,
+        cpu_limit_sec: int = 60,
+        memory_limit_mb: int = 512,
+    ) -> ToolResult:
+        """Execute an existing Python file on the target host with optional sandboxed dependencies."""
+        started = time.monotonic()
+        if not path.strip():
+            return _result(
+                "execute_python_file",
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000,
+                error_code="PATH_REQUIRED",
+                error_stage="validation",
+                message="path is required",
+            )
+
+        runtime_env = dict(env or {})
+        sandbox_info: dict[str, Any] | None = None
+        database_env, env_error = await _resolve_database_env(
+            "execute_python_file",
+            started=started,
+            database_profile=database_profile,
+            database=database,
+            db_env_var=db_env_var,
+        )
+        if env_error:
+            return env_error
+        runtime_env.update(database_env or {})
+
+        pool = get_pool()
+        conn = await pool.acquire()
+        try:
+            capabilities = await conn.probe_capabilities()
+        finally:
+            pool.release(conn)
+
+        if not capabilities.python_command:
+            return _result(
+                "execute_python_file",
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000,
+                error_code="PYTHON_UNAVAILABLE",
+                error_stage="capability_probe",
+                message="Python is not available on the target host.",
+                data={"capabilities": capabilities.to_dict()},
+            )
+
+        python_bin = capabilities.python_command
+        try:
+            if sandbox_path or requirements:
+                sandbox_info, _ = await ensure_python_sandbox(
+                    sandbox_path_value=sandbox_path or build_sandbox_path(name="python"),
+                    requirements=requirements,
+                )
+                python_bin = str(sandbox_info["python"])
+                sandbox_root = str(sandbox_info["path"])
+                runtime_env["VIRTUAL_ENV"] = sandbox_root
+                runtime_env["PATH"] = f"{sandbox_root}/bin:$PATH"
+
+            result, usage, capability_data, duration_ms = await _run_execution(
+                command=_argv_command(python_bin, [path, *(args or [])]),
+                cwd=cwd,
+                timeout=timeout,
+                env=runtime_env,
+                capture_usage=capture_usage,
+                cpu_limit_sec=cpu_limit_sec,
+                memory_limit_mb=memory_limit_mb,
+            )
+        except Exception as exc:
+            return _result(
+                "execute_python_file",
+                ok=False,
+                duration_ms=(time.monotonic() - started) * 1000,
+                stderr_text=str(exc),
+                error_code="PYTHON_EXECUTION_SETUP_FAILED",
+                error_stage="setup",
+                message="Failed to prepare Python file execution.",
+                data={"sandbox": sandbox_info, "path": path},
+            )
+
+        error_code, error_stage = _error_code_for_result(result)
+        return _result(
+            "execute_python_file",
+            ok=result.ok,
+            duration_ms=duration_ms,
+            stdout_text=result.stdout,
+            stderr_text=result.stderr,
+            error_code=error_code,
+            error_stage=error_stage,
+            message=None if result.ok else "Python file execution failed.",
+            exit_code=result.exit_code,
+            data={
+                "capabilities": capability_data,
+                "sandbox": sandbox_info,
+                "cwd": _safe_cwd(cwd) or None,
+                "path": path,
+                "args": args or [],
             },
             usage=usage,
         )
@@ -727,7 +894,7 @@ def register(mcp: FastMCP):
                     "cwd": settings.default_cwd or None,
                     "timeout_sec": settings.default_command_timeout,
                     "output_limit_bytes": settings.output_limit_bytes,
-                    "sandbox_root": _sandbox_root(),
+                    "sandbox_root": sandbox_root(),
                 },
                 "capabilities": capabilities.to_dict(),
             },
@@ -810,8 +977,8 @@ def register(mcp: FastMCP):
         """Create a reusable virtualenv sandbox on the target host."""
         started = time.monotonic()
         try:
-            sandbox_info, capabilities = await _ensure_python_sandbox(
-                sandbox_path=_sandbox_path(name=name, path=path),
+            sandbox_info, capabilities = await ensure_python_sandbox(
+                sandbox_path_value=build_sandbox_path(name=name, path=path),
                 requirements=requirements,
                 recreate=recreate,
             )
@@ -840,7 +1007,7 @@ def register(mcp: FastMCP):
         pool = get_pool()
         conn = await pool.acquire()
         try:
-            search_root = base_path or _sandbox_root()
+            search_root = base_path or sandbox_root()
             command = (
                 f"test -d {shlex.quote(search_root)} || exit 0; "
                 f"find {shlex.quote(search_root)} -maxdepth 3 -name pyvenv.cfg -print"
@@ -855,7 +1022,7 @@ def register(mcp: FastMCP):
                 error_code="SANDBOX_LIST_FAILED",
                 error_stage="inspection",
                 message="Failed to list Python sandboxes.",
-                data={"base_path": base_path or _sandbox_root()},
+                data={"base_path": base_path or sandbox_root()},
             )
         finally:
             pool.release(conn)
@@ -876,7 +1043,7 @@ def register(mcp: FastMCP):
             error_stage=error_stage,
             message=None if result.ok else "Failed to enumerate sandboxes.",
             exit_code=result.exit_code,
-            data={"base_path": base_path or _sandbox_root(), "sandboxes": sandboxes},
+            data={"base_path": base_path or sandbox_root(), "sandboxes": sandboxes},
         )
 
     @mcp.tool(structured_output=True)
@@ -893,7 +1060,7 @@ def register(mcp: FastMCP):
                 message="path is required",
             )
 
-        root = PurePosixPath(_sandbox_root())
+        root = PurePosixPath(sandbox_root())
         target = PurePosixPath(path)
         if root not in target.parents and target != root:
             return _result(

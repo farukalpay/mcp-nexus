@@ -25,6 +25,7 @@ from starlette.responses import HTMLResponse
 
 from mcp_nexus.config import Settings
 from mcp_nexus.gateway import GatewayAccessToken, GatewayBinding, GatewayManager
+from mcp_nexus.state import EncryptedStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -272,18 +273,18 @@ button {
 
 
 class GatewayAuthorizationCode(AuthorizationCode):
+    binding_id: str
     ssh_host: str
     ssh_port: int
     ssh_user: str
-    ssh_password: str
 
 
 class GatewayRefreshToken(RefreshToken):
     resource: str | None = None
+    binding_id: str
     ssh_host: str
     ssh_port: int
     ssh_user: str
-    ssh_password: str
 
 
 @dataclass
@@ -305,13 +306,21 @@ class GatewayOAuthProvider(
 ):
     """OAuth provider that binds each ChatGPT connection to an SSH target."""
 
-    def __init__(self, settings: Settings, gateway: GatewayManager):
+    def __init__(
+        self,
+        settings: Settings,
+        gateway: GatewayManager,
+        *,
+        state_store: EncryptedStateStore | None = None,
+    ):
         self._settings = settings
         self._gateway = gateway
+        self._state_store = state_store
         self._clients: dict[str, OAuthClientInformationFull] = {}
         self._authorization_requests: dict[str, AuthorizationRequestState] = {}
         self._authorization_codes: dict[str, GatewayAuthorizationCode] = {}
         self._refresh_tokens: dict[str, GatewayRefreshToken] = {}
+        self._restore_state()
         self._register_static_client()
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
@@ -324,6 +333,7 @@ class GatewayOAuthProvider(
         if client_id in self._clients:
             raise ValueError(f"client_id {client_id!r} already exists")
         self._clients[client_id] = client_info
+        self._persist_state()
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         request_id = secrets.token_urlsafe(24)
@@ -338,6 +348,7 @@ class GatewayOAuthProvider(
             resource=params.resource or self._settings.oauth_resource_server_url or None,
             created_at=time.time(),
         )
+        self._persist_state()
         return f"{self._settings.oauth_consent_url}?{urlencode({'request_id': request_id})}"
 
     async def load_authorization_code(
@@ -374,6 +385,7 @@ class GatewayOAuthProvider(
             resource=authorization_code.resource,
         )
         self._refresh_tokens[refresh_token.token] = refresh_token
+        self._persist_state()
         return OAuthToken(
             access_token=access_token.access_token,
             expires_in=access_token.expires_in,
@@ -417,6 +429,7 @@ class GatewayOAuthProvider(
             resource=refresh_token.resource,
         )
         self._refresh_tokens[rotated_refresh_token.token] = rotated_refresh_token
+        self._persist_state()
         return OAuthToken(
             access_token=access_token.access_token,
             expires_in=access_token.expires_in,
@@ -433,6 +446,7 @@ class GatewayOAuthProvider(
     async def revoke_token(self, token: GatewayAccessToken | GatewayRefreshToken) -> None:
         if isinstance(token, GatewayRefreshToken):
             self._refresh_tokens.pop(token.token, None)
+            self._persist_state()
             return
         self._gateway.revoke_access_token(token.token)
 
@@ -457,6 +471,7 @@ class GatewayOAuthProvider(
 
         if decision != "approve":
             self._authorization_requests.pop(request_id, None)
+            self._persist_state()
             return construct_redirect_uri(
                 str(request.redirect_uri),
                 error="access_denied",
@@ -483,12 +498,13 @@ class GatewayOAuthProvider(
             redirect_uri=request.redirect_uri,
             redirect_uri_provided_explicitly=request.redirect_uri_provided_explicitly,
             resource=request.resource,
+            binding_id=binding.binding_id,
             ssh_host=binding.ssh_host,
             ssh_port=binding.ssh_port,
             ssh_user=binding.ssh_user,
-            ssh_password=binding.ssh_password,
         )
         self._authorization_codes[code.code] = code
+        self._persist_state()
         return construct_redirect_uri(
             str(request.redirect_uri),
             code=code.code,
@@ -662,16 +678,110 @@ class GatewayOAuthProvider(
             scopes=scopes,
             expires_at=expires_at,
             resource=resource,
+            binding_id=binding.binding_id,
             ssh_host=binding.ssh_host,
             ssh_port=binding.ssh_port,
             ssh_user=binding.ssh_user,
-            ssh_password=binding.ssh_password,
         )
 
     def _default_scopes_for_client(self, client: OAuthClientInformationFull) -> list[str]:
         if client.scope:
             return client.scope.split()
         return self._settings.oauth_required_scopes
+
+    def _restore_state(self) -> None:
+        if self._state_store is None:
+            return
+
+        payload = self._state_store.read_section("oauth")
+
+        clients_payload = payload.get("clients", {})
+        if isinstance(clients_payload, dict):
+            for client_id, client_payload in clients_payload.items():
+                if isinstance(client_payload, dict):
+                    self._clients[client_id] = OAuthClientInformationFull.model_validate(client_payload)
+
+        requests_payload = payload.get("authorization_requests", {})
+        if isinstance(requests_payload, dict):
+            for request_id, request_payload in requests_payload.items():
+                if not isinstance(request_payload, dict):
+                    continue
+                self._authorization_requests[request_id] = AuthorizationRequestState(
+                    request_id=str(request_payload.get("request_id", request_id)),
+                    client_id=str(request_payload.get("client_id", "")),
+                    redirect_uri=cast(AnyUrl, str(request_payload.get("redirect_uri", ""))),
+                    redirect_uri_provided_explicitly=bool(
+                        request_payload.get("redirect_uri_provided_explicitly", False)
+                    ),
+                    code_challenge=str(request_payload.get("code_challenge", "")),
+                    state=str(request_payload["state"]) if request_payload.get("state") is not None else None,
+                    scopes=[str(item) for item in request_payload.get("scopes", [])],
+                    resource=str(request_payload["resource"]) if request_payload.get("resource") is not None else None,
+                    created_at=float(request_payload.get("created_at", time.time())),
+                )
+
+        codes_payload = payload.get("authorization_codes", {})
+        if isinstance(codes_payload, dict):
+            for code_id, code_payload in codes_payload.items():
+                if not isinstance(code_payload, dict):
+                    continue
+                self._authorization_codes[code_id] = GatewayAuthorizationCode.model_validate(
+                    {"code": code_id, **code_payload}
+                )
+
+        refresh_payload = payload.get("refresh_tokens", {})
+        if isinstance(refresh_payload, dict):
+            for token_id, token_payload in refresh_payload.items():
+                if not isinstance(token_payload, dict):
+                    continue
+                self._refresh_tokens[token_id] = GatewayRefreshToken.model_validate(
+                    {"token": token_id, **token_payload}
+                )
+
+        self._prune_expired_state()
+
+    def _persist_state(self) -> None:
+        if self._state_store is None:
+            return
+
+        clients_payload = {
+            client_id: client.model_dump(mode="json", exclude_none=True)
+            for client_id, client in self._clients.items()
+        }
+        payload = {
+            "clients": clients_payload,
+            "authorization_requests": {
+                request_id: {
+                    "request_id": request.request_id,
+                    "client_id": request.client_id,
+                    "redirect_uri": str(request.redirect_uri),
+                    "redirect_uri_provided_explicitly": request.redirect_uri_provided_explicitly,
+                    "code_challenge": request.code_challenge,
+                    "state": request.state,
+                    "scopes": list(request.scopes),
+                    "resource": request.resource,
+                    "created_at": request.created_at,
+                }
+                for request_id, request in self._authorization_requests.items()
+            },
+            "authorization_codes": {
+                code_id: {
+                    key: value
+                    for key, value in code.model_dump(mode="json", exclude_none=True).items()
+                    if key != "code"
+                }
+                for code_id, code in self._authorization_codes.items()
+            },
+            "refresh_tokens": {
+                token_id: {
+                    key: value
+                    for key, value in token.model_dump(mode="json", exclude_none=True).items()
+                    if key != "token"
+                }
+                for token_id, token in self._refresh_tokens.items()
+            },
+        }
+        self._state_store.write_section("oauth", payload)
 
     def _register_static_client(self) -> None:
         if not self._settings.oauth_static_client_enabled:
@@ -694,37 +804,41 @@ class GatewayOAuthProvider(
             scope=" ".join(self._settings.oauth_default_scopes or self._settings.oauth_required_scopes),
         )
         self._clients[client_info.client_id or ""] = client_info
+        self._persist_state()
 
     def _binding_from_code(self, code: GatewayAuthorizationCode) -> GatewayBinding:
-        return GatewayBinding(
-            ssh_host=code.ssh_host,
-            ssh_port=code.ssh_port,
-            ssh_user=code.ssh_user,
-            ssh_password=code.ssh_password,
-        )
+        binding = self._gateway.get_binding(code.binding_id)
+        if binding is None:
+            raise ValueError("Authorization code references an expired target binding.")
+        return binding
 
     def _binding_from_refresh_token(self, token: GatewayRefreshToken) -> GatewayBinding:
-        return GatewayBinding(
-            ssh_host=token.ssh_host,
-            ssh_port=token.ssh_port,
-            ssh_user=token.ssh_user,
-            ssh_password=token.ssh_password,
-        )
+        binding = self._gateway.get_binding(token.binding_id)
+        if binding is None:
+            raise ValueError("Refresh token references an expired target binding.")
+        return binding
 
     def _prune_expired_state(self) -> None:
         now = time.time()
         request_ttl = self._settings.oauth_authorization_code_ttl_seconds
+        changed = False
         for request_id, request in list(self._authorization_requests.items()):
             if request.created_at + request_ttl < now:
                 self._authorization_requests.pop(request_id, None)
+                changed = True
 
         for code_id, code in list(self._authorization_codes.items()):
             if code.expires_at < now:
                 self._authorization_codes.pop(code_id, None)
+                changed = True
 
         for token_id, token in list(self._refresh_tokens.items()):
             if token.expires_at is not None and token.expires_at < now:
                 self._refresh_tokens.pop(token_id, None)
+                changed = True
+
+        if changed:
+            self._persist_state()
 
     def _render_error_page(self, title: str, message: str) -> str:
         return f"""<!doctype html>

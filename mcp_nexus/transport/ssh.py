@@ -195,9 +195,10 @@ class SSHPool:
             return conn
 
     def backend_metadata(self) -> dict[str, str]:
+        backend_host = self._settings.ssh_host if self._is_local else self._settings.resolved_ssh_host
         return {
             "backend_kind": "local" if self._is_local else "ssh",
-            "backend_instance": f"{self._settings.ssh_user}@{self._settings.ssh_host}:{self._settings.ssh_port}",
+            "backend_instance": f"{self._settings.ssh_user}@{backend_host}:{self._settings.ssh_port}",
         }
 
     def release(self, conn: SSHConnection):
@@ -210,7 +211,7 @@ class SSHPool:
         for attempt in range(3):
             try:
                 kwargs = dict(
-                    host=self._settings.ssh_host,
+                    host=self._settings.resolved_ssh_host,
                     port=self._settings.ssh_port,
                     username=self._settings.ssh_user,
                     known_hosts=None,
@@ -227,7 +228,11 @@ class SSHPool:
                     timeout=15,
                 )
                 self._connect_failures = 0
-                logger.info("SSH connection established to %s:%d", self._settings.ssh_host, self._settings.ssh_port)
+                logger.info(
+                    "SSH connection established to %s:%d",
+                    self._settings.resolved_ssh_host,
+                    self._settings.ssh_port,
+                )
                 return SSHConnection(raw_conn)
 
             except Exception as e:

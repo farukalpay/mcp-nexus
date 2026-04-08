@@ -51,3 +51,14 @@ async def test_pool_health(local_settings):
     assert health["status"] == "healthy"
     assert health["mode"] == "local"
     await pool.close()
+
+
+def test_containerized_loopback_target_does_not_use_local_exec():
+    settings = Settings()
+    settings.runtime_container = True
+    settings.allow_container_localhost_exec = False
+    settings.host_bridge_address = "host.docker.internal"
+    settings.ssh_host = "127.0.0.1"
+
+    pool = SSHPool(settings)
+    assert pool._is_local is False

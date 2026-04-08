@@ -39,6 +39,11 @@ fi
 
 echo "━━━ Deploying MCP Nexus to $USER@$HOST:$PORT ━━━"
 
+CURRENT_BIND_HOST="$("${SSH[@]}" "systemctl cat mcp-nexus --no-pager 2>/dev/null | sed -n 's/.*--host \\([^ ]*\\).*/\\1/p' | tail -n1" || true)"
+CURRENT_BIND_PORT="$("${SSH[@]}" "systemctl cat mcp-nexus --no-pager 2>/dev/null | sed -n 's/.*--port \\([0-9][0-9]*\\).*/\\1/p' | tail -n1" || true)"
+BIND_HOST="${NEXUS_DEPLOY_BIND_HOST:-${CURRENT_BIND_HOST:-127.0.0.1}}"
+BIND_PORT="${NEXUS_DEPLOY_BIND_PORT:-${CURRENT_BIND_PORT:-${NEXUS_PORT:-8766}}}"
+
 # 1. Create remote directory
 "${SSH[@]}" "mkdir -p $REMOTE_DIR"
 
@@ -87,7 +92,7 @@ StartLimitIntervalSec=120
 Type=simple
 User=root
 WorkingDirectory=$REMOTE_DIR
-ExecStart=$REMOTE_DIR/.venv/bin/python -m mcp_nexus serve --host 127.0.0.1 --port 8766
+ExecStart=$REMOTE_DIR/.venv/bin/python -m mcp_nexus serve --host $BIND_HOST --port $BIND_PORT
 Restart=always
 RestartSec=3
 OOMScoreAdjust=-500
@@ -109,7 +114,7 @@ echo "✓ Systemd service created"
         echo '
     # MCP Nexus
     location /mcp/nexus {
-        proxy_pass http://127.0.0.1:8766;
+        proxy_pass http://127.0.0.1:$BIND_PORT;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \"upgrade\";
@@ -124,7 +129,7 @@ echo "✓ Systemd service created"
 
     # Legacy MCP path compatibility
     location /mcp {
-        proxy_pass http://127.0.0.1:8766/mcp/nexus;
+        proxy_pass http://127.0.0.1:$BIND_PORT/mcp/nexus;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \"upgrade\";
@@ -138,27 +143,27 @@ echo "✓ Systemd service created"
     }
 
     location /health/nexus {
-        proxy_pass http://127.0.0.1:8766/health;
+        proxy_pass http://127.0.0.1:$BIND_PORT/health;
         proxy_read_timeout 5s;
     }
 
     location /ready/nexus {
-        proxy_pass http://127.0.0.1:8766/ready;
+        proxy_pass http://127.0.0.1:$BIND_PORT/ready;
         proxy_read_timeout 5s;
     }
 
     location /version/nexus {
-        proxy_pass http://127.0.0.1:8766/version;
+        proxy_pass http://127.0.0.1:$BIND_PORT/version;
         proxy_read_timeout 5s;
     }
 
     location /info/nexus {
-        proxy_pass http://127.0.0.1:8766/info;
+        proxy_pass http://127.0.0.1:$BIND_PORT/info;
         proxy_read_timeout 5s;
     }
 
     location = /.well-known/oauth-authorization-server {
-        proxy_pass http://127.0.0.1:8766/.well-known/oauth-authorization-server;
+        proxy_pass http://127.0.0.1:$BIND_PORT/.well-known/oauth-authorization-server;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -167,7 +172,7 @@ echo "✓ Systemd service created"
     }
 
     location /.well-known/oauth-protected-resource/ {
-        proxy_pass http://127.0.0.1:8766/.well-known/oauth-protected-resource/;
+        proxy_pass http://127.0.0.1:$BIND_PORT/.well-known/oauth-protected-resource/;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -176,7 +181,7 @@ echo "✓ Systemd service created"
     }
 
     location = /authorize {
-        proxy_pass http://127.0.0.1:8766/authorize;
+        proxy_pass http://127.0.0.1:$BIND_PORT/authorize;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -185,7 +190,7 @@ echo "✓ Systemd service created"
     }
 
     location = /token {
-        proxy_pass http://127.0.0.1:8766/token;
+        proxy_pass http://127.0.0.1:$BIND_PORT/token;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -194,7 +199,7 @@ echo "✓ Systemd service created"
     }
 
     location = /register {
-        proxy_pass http://127.0.0.1:8766/register;
+        proxy_pass http://127.0.0.1:$BIND_PORT/register;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -203,7 +208,7 @@ echo "✓ Systemd service created"
     }
 
     location = /oauth/consent {
-        proxy_pass http://127.0.0.1:8766/oauth/consent;
+        proxy_pass http://127.0.0.1:$BIND_PORT/oauth/consent;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -212,7 +217,7 @@ echo "✓ Systemd service created"
     }
 
     location = /oauth/token {
-        proxy_pass http://127.0.0.1:8766/oauth/token;
+        proxy_pass http://127.0.0.1:$BIND_PORT/oauth/token;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;

@@ -264,6 +264,8 @@ def render_mcp_entry_page(settings: Settings) -> HTMLResponse:
     )
     auth_url = f"{settings.oauth_issuer_url.rstrip('/')}/authorize" if settings.oauth_issuer_url else "/authorize"
     token_url = f"{settings.oauth_issuer_url.rstrip('/')}/token" if settings.oauth_issuer_url else "/token"
+    register_url = f"{settings.oauth_issuer_url.rstrip('/')}/register" if settings.oauth_issuer_url else "/register"
+    authorization_server_base = settings.oauth_issuer_url or public_base_url or "/"
 
     manual_client_id = settings.oauth_client_id or "Configure NEXUS_OAUTH_CLIENT_ID on your server"
     manual_client_secret = _manual_client_secret(settings)
@@ -348,8 +350,12 @@ def render_mcp_entry_page(settings: Settings) -> HTMLResponse:
           </div>
           <div class="side-card">
             <span class="label">Manual OAuth Values</span>
+            <p class="value">MCP URL: {escape(mcp_url)}</p>
             <p class="value">Auth URL: {escape(auth_url)}</p>
             <p class="value">Token URL: {escape(token_url)}</p>
+            <p class="value">Registration URL: {escape(register_url)}</p>
+            <p class="value">Authorization Server Base: {escape(authorization_server_base)}</p>
+            <p class="value">Resource: {escape(mcp_url)}</p>
             <p class="value">Client ID: {escape(manual_client_id)}</p>
             <p class="value">Client Secret: {escape(manual_client_secret)}</p>
             <p class="value">Scope: nexus</p>

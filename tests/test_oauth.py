@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 from starlette.testclient import TestClient
 
 from mcp_nexus.config import Settings
-from mcp_nexus.server import create_app
+from mcp_nexus.server import _transport_security_settings, create_app
 
 
 def _pkce_pair(verifier: str) -> tuple[str, str]:
@@ -55,6 +55,38 @@ def test_mcp_requires_auth_and_exposes_metadata():
         assert payload["registration_endpoint"] == "https://example.com/register"
 
 
+def test_public_host_header_is_accepted_for_local_bind_when_public_origin_is_configured():
+    settings = _oauth_settings()
+    settings.host = "127.0.0.1"
+    settings.oauth_client_redirect_uris = ["https://chatgpt.com/connector/oauth/test"]
+    app = create_app(settings, enable_watchdog=False)
+
+    with TestClient(app, base_url="https://example.com") as client:
+        response = client.post(
+            "/mcp/nexus",
+            json={},
+            headers={"origin": "https://chatgpt.com"},
+        )
+        assert response.status_code == 401
+
+
+def test_transport_security_settings_only_allow_configured_public_hosts():
+    settings = _oauth_settings()
+    settings.host = "127.0.0.1"
+    security = _transport_security_settings(settings)
+    assert security is not None
+    assert "example.com" in security.allowed_hosts
+    assert "evil.example.com" not in security.allowed_hosts
+
+
+def test_health_alias_route_exists():
+    app = create_app(_oauth_settings(), enable_watchdog=False)
+
+    with TestClient(app) as client:
+        response = client.get("/health/nexus")
+        assert response.status_code == 200
+
+
 def test_mcp_browser_get_renders_connect_landing_without_breaking_auth_surface():
     app = create_app(_oauth_settings(), enable_watchdog=False)
 
@@ -64,6 +96,8 @@ def test_mcp_browser_get_renders_connect_landing_without_breaking_auth_surface()
         assert "Connect your AI to a real server." in landing.text
         assert "View On GitHub" in landing.text
         assert "Manual OAuth Values" in landing.text
+        assert "Registration URL" in landing.text
+        assert "Resource:" in landing.text
 
         api_like = client.get("/mcp/nexus", headers={"Accept": "application/json"})
         assert api_like.status_code == 401
@@ -211,3 +245,87 @@ def test_static_oauth_client_authorization_code_flow_completes_without_dynamic_r
         token_payload = token.json()
         assert token_payload["token_type"] == "Bearer"
         assert token_payload["access_token"]
+
+
+def test_dynamic_oauth_state_survives_restart(tmp_path):
+    settings = _oauth_settings()
+    settings.state_root = str(tmp_path / "state")
+    verifier, challenge = _pkce_pair("codex-persisted-state-verifier")
+
+    app = create_app(settings, enable_watchdog=False)
+    with TestClient(app) as client:
+        registration = client.post(
+            "/register",
+            json={
+                "redirect_uris": ["https://chat.openai.com/aip/callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "client_secret_post",
+            },
+        )
+        assert registration.status_code == 201
+        client_info = registration.json()
+
+        authorize = client.get(
+            "/authorize",
+            params={
+                "client_id": client_info["client_id"],
+                "redirect_uri": "https://chat.openai.com/aip/callback",
+                "response_type": "code",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": "state-restart",
+                "resource": "https://example.com/mcp/nexus",
+            },
+            follow_redirects=False,
+        )
+        request_id = parse_qs(urlparse(authorize.headers["location"]).query)["request_id"][0]
+
+        approval = client.post(
+            "/oauth/consent",
+            data={
+                "request_id": request_id,
+                "decision": "approve",
+                "ssh_host": "127.0.0.1",
+                "ssh_user": "root",
+                "ssh_port": "22",
+                "ssh_password": "",
+            },
+            follow_redirects=False,
+        )
+        code = parse_qs(urlparse(approval.headers["location"]).query)["code"][0]
+
+        token_response = client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "https://chat.openai.com/aip/callback",
+                "client_id": client_info["client_id"],
+                "client_secret": client_info["client_secret"],
+                "code_verifier": verifier,
+                "resource": "https://example.com/mcp/nexus",
+            },
+        )
+        assert token_response.status_code == 200
+        token_payload = token_response.json()
+
+    restarted_app = create_app(settings, enable_watchdog=False)
+    with TestClient(restarted_app) as restarted_client:
+        refresh_response = restarted_client.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": token_payload["refresh_token"],
+                "client_id": client_info["client_id"],
+                "client_secret": client_info["client_secret"],
+            },
+        )
+        assert refresh_response.status_code == 200
+
+        authenticated_post = restarted_client.post(
+            "/mcp/nexus",
+            json={},
+            headers={"Authorization": f"Bearer {token_payload['access_token']}"},
+        )
+        assert authenticated_post.status_code != 401
