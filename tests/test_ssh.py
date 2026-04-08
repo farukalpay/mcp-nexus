@@ -1,8 +1,9 @@
 """Tests for SSH connection pool (localhost mode only — no real SSH needed)."""
 
 import pytest
+
 from mcp_nexus.config import Settings
-from mcp_nexus.transport.ssh import SSHPool, SSHConnection, CommandResult
+from mcp_nexus.transport.ssh import CommandResult, SSHConnection, SSHPool
 
 
 @pytest.fixture

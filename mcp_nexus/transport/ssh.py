@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import asyncssh
 
 from mcp_nexus.config import Settings
+from mcp_nexus.runtime import ServerCapabilities, capability_probe_command, parse_capability_output
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ class SSHConnection:
         self._conn = conn
         self._is_local = is_local
         self._last_used = time.monotonic()
+        self._capabilities: ServerCapabilities | None = None
+        self._capabilities_at: float = 0.0
 
     @property
     def is_alive(self) -> bool:
@@ -68,13 +71,24 @@ class SSHConnection:
 
     async def _run_ssh(self, command: str, timeout: int) -> CommandResult:
         try:
+            assert self._conn is not None
             result = await asyncio.wait_for(
                 self._conn.run(command, check=False),
                 timeout=timeout,
             )
+            stdout = (
+                result.stdout.decode("utf-8", errors="replace")
+                if isinstance(result.stdout, bytes)
+                else (result.stdout or "")
+            )
+            stderr = (
+                result.stderr.decode("utf-8", errors="replace")
+                if isinstance(result.stderr, bytes)
+                else (result.stderr or "")
+            )
             return CommandResult(
-                stdout=result.stdout or "",
-                stderr=result.stderr or "",
+                stdout=stdout,
+                stderr=stderr,
                 exit_code=result.exit_status or 0,
             )
         except TimeoutError:
@@ -103,20 +117,24 @@ class SSHConnection:
 
     async def write_file(self, path: str, content: str) -> None:
         if self._is_local:
-            import aiofiles
+            import aiofiles  # type: ignore[import-untyped]
+
             async with aiofiles.open(path, "w") as f:
                 await f.write(content)
         else:
+            assert self._conn is not None
             async with self._conn.start_sftp_client() as sftp:
                 async with sftp.open(path, "w") as f:
                     await f.write(content)
 
     async def read_file_bytes(self, path: str) -> bytes:
         if self._is_local:
-            import aiofiles
+            import aiofiles  # type: ignore[import-untyped]
+
             async with aiofiles.open(path, "rb") as f:
                 return await f.read()
         else:
+            assert self._conn is not None
             async with self._conn.start_sftp_client() as sftp:
                 async with sftp.open(path, "rb") as f:
                     return await f.read()
@@ -128,6 +146,17 @@ class SSHConnection:
     async def list_dir(self, path: str) -> list[str]:
         result = await self.run(f"ls -1a {shlex.quote(path)}")
         return [f for f in result.strip().split("\n") if f and f not in (".", "..")]
+
+    async def probe_capabilities(self, refresh: bool = False) -> ServerCapabilities:
+        """Detect command, package, and service capabilities on the target host."""
+        if not refresh and self._capabilities and (time.monotonic() - self._capabilities_at) < 300:
+            return self._capabilities
+
+        result = await self.run_full(capability_probe_command(), timeout=20)
+        capabilities = parse_capability_output(result.stdout)
+        self._capabilities = capabilities
+        self._capabilities_at = time.monotonic()
+        return capabilities
 
 
 class SSHPool:
@@ -164,6 +193,12 @@ class SSHPool:
             conn = await self._create_connection()
             self._connections.append(conn)
             return conn
+
+    def backend_metadata(self) -> dict[str, str]:
+        return {
+            "backend_kind": "local" if self._is_local else "ssh",
+            "backend_instance": f"{self._settings.ssh_user}@{self._settings.ssh_host}:{self._settings.ssh_port}",
+        }
 
     def release(self, conn: SSHConnection):
         """Release connection back to pool."""

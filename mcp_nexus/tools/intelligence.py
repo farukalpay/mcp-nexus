@@ -6,6 +6,7 @@ import json
 
 from mcp.server.fastmcp import FastMCP
 
+from mcp_nexus.catalog import TOOL_CATEGORIES, catalog_summary
 from mcp_nexus.server import get_memory
 
 
@@ -54,12 +55,20 @@ def register(mcp: FastMCP):
         if not memory:
             return json.dumps({"status": "intelligence disabled"})
 
-        suggestions = await memory.suggest_next(current_tool) if current_tool else []
         ctx = await memory.get_context()
-        return json.dumps({
-            "next_tools": suggestions,
-            "recent_context": ctx.get("recent_actions", [])[:3],
-        }, indent=2)
+        if not current_tool:
+            recent = ctx.get("recent_actions", [])
+            if recent:
+                current_tool = recent[0]["tool"]
+        suggestions = await memory.suggest_next(current_tool) if current_tool else []
+        return json.dumps(
+            {
+                "based_on": current_tool or None,
+                "next_tools": suggestions,
+                "recent_context": ctx.get("recent_actions", [])[:3],
+            },
+            indent=2,
+        )
 
     @mcp.tool()
     async def nexus_preferences(action: str = "list", key: str = "", value: str = "") -> str:
@@ -84,3 +93,24 @@ def register(mcp: FastMCP):
 
         prefs = await memory.get_preferences()
         return json.dumps(prefs, indent=2)
+
+    @mcp.tool()
+    async def nexus_workflows() -> str:
+        """Return the strongest detected multi-step workflows from historical usage."""
+        memory = get_memory()
+        if not memory:
+            return json.dumps({"status": "intelligence disabled"})
+        return json.dumps({"workflows": await memory.get_workflows()}, indent=2)
+
+    @mcp.tool()
+    async def nexus_tool_catalog() -> str:
+        """Return the explicit Nexus tool catalog by category."""
+        summary = catalog_summary()
+        return json.dumps(
+            {
+                "total_tools": summary.total_tools,
+                "categories": {category: list(tools) for category, tools in TOOL_CATEGORIES.items()},
+                "category_counts": summary.category_counts,
+            },
+            indent=2,
+        )

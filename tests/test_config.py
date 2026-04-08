@@ -1,7 +1,7 @@
 """Tests for configuration module."""
 
-import os
-import pytest
+import json
+
 from mcp_nexus.config import Settings
 
 
@@ -35,3 +35,43 @@ def test_db_dsn():
     s.db_user = "user"
     s.db_password = "pass"
     assert "postgresql://user:pass@localhost:5432/test" == s.db_dsn
+
+
+def test_database_profiles_from_json(monkeypatch):
+    monkeypatch.setenv(
+        "NEXUS_DB_PROFILES_JSON",
+        json.dumps(
+            {
+                "warehouse": {
+                    "host": "db.internal",
+                    "port": 5433,
+                    "database": "analytics",
+                    "user": "readonly",
+                    "password": "secret",
+                }
+            }
+        ),
+    )
+    monkeypatch.setenv("NEXUS_DB_DEFAULT_PROFILE", "warehouse")
+
+    settings = Settings()
+    profile = settings.resolve_db_profile()
+    assert profile is not None
+    assert profile.name == "warehouse"
+    assert profile.host == "db.internal"
+    assert profile.database == "analytics"
+
+
+def test_database_profiles_legacy_fallback(monkeypatch):
+    monkeypatch.delenv("NEXUS_DB_PROFILES_JSON", raising=False)
+    monkeypatch.setenv("NEXUS_DB_HOST", "localhost")
+    monkeypatch.setenv("NEXUS_DB_PORT", "5432")
+    monkeypatch.setenv("NEXUS_DB_NAME", "legacy")
+    monkeypatch.setenv("NEXUS_DB_USER", "postgres")
+    monkeypatch.setenv("NEXUS_DB_PASSWORD", "pw")
+    monkeypatch.setenv("NEXUS_DB_DEFAULT_PROFILE", "default")
+
+    settings = Settings()
+    profiles = settings.database_profiles()
+    assert "default" in profiles
+    assert profiles["default"].database == "legacy"

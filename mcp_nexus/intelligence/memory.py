@@ -10,6 +10,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from mcp_nexus.catalog import category_for_tool
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS interactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +142,8 @@ class MemoryEngine:
     }
 
     def _learn_preferences(self, tool: str, args: dict[str, Any], now: float):
+        if not self._conn:
+            return
         for arg_key, pref_key in self._PREFERENCE_KEYS.items():
             value = args.get(arg_key)
             if not value or not isinstance(value, str):
@@ -210,7 +214,7 @@ class MemoryEngine:
                 (row["id"],),
             ).fetchall()
             ctx["recent_actions"] = [
-                {"tool": t["tool"], "args": t["args_summary"], "ok": bool(t["success"])}
+                {"tool": t["tool"], "args": self._parse_args_summary(t["args_summary"]), "ok": bool(t["success"])}
                 for t in tools
             ]
 
@@ -220,7 +224,11 @@ class MemoryEngine:
         ).fetchall()
         if errors:
             ctx["recent_errors"] = [
-                {"tool": e["tool"], "args": e["args_summary"], "ago_min": round((time.time() - e["ts"]) / 60, 1)}
+                {
+                    "tool": e["tool"],
+                    "args": self._parse_args_summary(e["args_summary"]),
+                    "ago_min": round((time.time() - e["ts"]) / 60, 1),
+                }
                 for e in errors
             ]
 
@@ -270,42 +278,27 @@ class MemoryEngine:
         ).fetchall()
         insights["top_tools"] = {t["tool"]: t["cnt"] for t in tools}
 
-        # Tool categories
-        categories = Counter()
-        category_map = {
-            "filesystem": [
-                "read_file", "write_file", "edit_file", "list_directory", "search_files",
-                "search_content", "file_info", "move_file", "delete_file", "create_directory", "tree",
-            ],
-            "terminal": ["execute_command", "execute_script", "environment_info", "which_command"],
-            "git": [
-                "git_status", "git_diff", "git_log", "git_commit",
-                "git_branch", "git_pull", "git_push", "git_stash",
-            ],
-            "services": [
-                "list_services", "service_status", "restart_service", "start_service",
-                "stop_service", "view_logs", "list_processes", "kill_process", "cron_list", "cron_add",
-            ],
-            "database": ["db_query", "db_tables", "db_schema", "db_execute", "db_size"],
-            "monitoring": [
-                "server_health", "disk_usage", "memory_usage", "cpu_usage",
-                "network_stats", "active_connections", "nginx_status", "docker_status",
-            ],
-            "deploy": [
-                "deploy_sync", "deploy_service", "create_backup",
-                "list_backups", "restore_backup", "pip_install",
-            ],
-            "network": [
-                "check_port", "dns_lookup", "ssl_info",
-                "firewall_rules", "curl_test", "listening_ports",
-            ],
-        }
+        # Tool categories use the explicit catalog, not inferred prefixes.
+        categories: Counter[str] = Counter()
         for t in tools:
-            for cat, tool_list in category_map.items():
-                if t["tool"] in tool_list:
-                    categories[cat] += t["cnt"]
+            category = category_for_tool(t["tool"])
+            if category:
+                categories[category] += t["cnt"]
         if categories:
             insights["focus_areas"] = dict(categories.most_common())
+
+        slow_tools = self._conn.execute(
+            "SELECT tool, AVG(duration_ms) as avg_ms FROM interactions "
+            "GROUP BY tool HAVING COUNT(*) >= 1 ORDER BY avg_ms DESC LIMIT 10"
+        ).fetchall()
+        insights["slow_tools"] = {
+            row["tool"]: round(row["avg_ms"], 1) for row in slow_tools if row["avg_ms"] is not None
+        }
+
+        failure_hotspots = self._conn.execute(
+            "SELECT tool, COUNT(*) as cnt FROM interactions WHERE success=0 GROUP BY tool ORDER BY cnt DESC LIMIT 10"
+        ).fetchall()
+        insights["failure_hotspots"] = {row["tool"]: row["cnt"] for row in failure_hotspots}
 
         # Sessions
         row = self._conn.execute("SELECT COUNT(*) as cnt FROM sessions").fetchone()
@@ -326,8 +319,7 @@ class MemoryEngine:
         ).fetchall()
         total = sum(r["count"] for r in rows) if rows else 1
         return [
-            {"tool": r["next_tool"], "probability": round(r["count"] / total, 2), "times": r["count"]}
-            for r in rows
+            {"tool": r["next_tool"], "probability": round(r["count"] / total, 2), "times": r["count"]} for r in rows
         ]
 
     async def get_workflows(self) -> list[dict[str, Any]]:
@@ -387,9 +379,12 @@ class MemoryEngine:
         if not self._conn:
             return
         self._conn.executescript(
-            "DELETE FROM interactions; DELETE FROM preferences; "
-            "DELETE FROM sessions; DELETE FROM tool_sequences;"
+            "DELETE FROM interactions; DELETE FROM preferences; DELETE FROM sessions; DELETE FROM tool_sequences;"
         )
+        self._conn.commit()
+        self._current_session = None
+        self._last_tool = None
+        self._last_activity = 0
 
     # ── internal ──
 
@@ -400,12 +395,14 @@ class MemoryEngine:
 
         self._finalize_session()
 
+        assert self._conn is not None
         cur = self._conn.execute(
             "INSERT INTO sessions (started_at, last_activity, tool_count) VALUES (?, ?, 0)",
             (now, now),
         )
         self._current_session = cur.lastrowid
-        return self._current_session
+        assert self._current_session is not None
+        return int(self._current_session)
 
     def _finalize_session(self):
         """Write a summary for the ending session."""
@@ -439,3 +436,10 @@ class MemoryEngine:
                 v = v[:120] + "..."
             interesting[k] = v
         return json.dumps(interesting, default=str) if interesting else "{}"
+
+    @staticmethod
+    def _parse_args_summary(summary: str) -> dict[str, Any] | str:
+        try:
+            return json.loads(summary)
+        except Exception:
+            return summary

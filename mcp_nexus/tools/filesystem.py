@@ -29,13 +29,15 @@ def register(mcp: FastMCP):
             if not result.ok:
                 return json.dumps({"error": result.stderr.strip(), "path": path})
             total = await conn.run(f"wc -l < {shlex.quote(path)}", timeout=10)
-            return json.dumps({
-                "path": path,
-                "content": result.stdout,
-                "offset": offset,
-                "limit": limit,
-                "total_lines": int(total.strip()) if total.strip().isdigit() else None,
-            })
+            return json.dumps(
+                {
+                    "path": path,
+                    "content": result.stdout,
+                    "offset": offset,
+                    "limit": limit,
+                    "total_lines": int(total.strip()) if total.strip().isdigit() else None,
+                }
+            )
         finally:
             pool.release(conn)
 
@@ -78,11 +80,13 @@ def register(mcp: FastMCP):
             if count == 0:
                 return json.dumps({"error": "old_string not found in file", "path": path})
             if count > 1 and not replace_all:
-                return json.dumps({
-                    "error": f"old_string found {count} times — set replace_all=true or provide more context",
-                    "path": path,
-                    "occurrences": count,
-                })
+                return json.dumps(
+                    {
+                        "error": f"old_string found {count} times — set replace_all=true or provide more context",
+                        "path": path,
+                        "occurrences": count,
+                    }
+                )
             if replace_all:
                 updated = current.replace(old_string, new_string)
             else:
@@ -169,11 +173,13 @@ def register(mcp: FastMCP):
                 cmd += f" {shlex.quote(pattern)} {shlex.quote(path)} | head -n {max_results}"
 
             result = await conn.run_full(cmd, timeout=60)
-            return json.dumps({
-                "pattern": pattern,
-                "base": path,
-                "matches": result.stdout.strip() if result.stdout.strip() else "(no matches)",
-            })
+            return json.dumps(
+                {
+                    "pattern": pattern,
+                    "base": path,
+                    "matches": result.stdout.strip() if result.stdout.strip() else "(no matches)",
+                }
+            )
         finally:
             pool.release(conn)
 
@@ -187,21 +193,26 @@ def register(mcp: FastMCP):
         pool = get_pool()
         conn = await pool.acquire()
         try:
-            cmd = f"stat -c '%s|%a|%U|%G|%y|%x|%F' {shlex.quote(path)} 2>/dev/null || stat -f '%z|%Lp|%Su|%Sg|%Sm|%Sa|%HT' {shlex.quote(path)}"
+            cmd = (
+                f"stat -c '%s|%a|%U|%G|%y|%x|%F' {shlex.quote(path)} 2>/dev/null || "
+                f"stat -f '%z|%Lp|%Su|%Sg|%Sm|%Sa|%HT' {shlex.quote(path)}"
+            )
             result = await conn.run_full(cmd, timeout=10)
             if not result.ok:
                 return json.dumps({"error": f"File not found: {path}"})
             parts = result.stdout.strip().split("|")
-            return json.dumps({
-                "path": path,
-                "size_bytes": parts[0] if len(parts) > 0 else "?",
-                "permissions": parts[1] if len(parts) > 1 else "?",
-                "owner": parts[2] if len(parts) > 2 else "?",
-                "group": parts[3] if len(parts) > 3 else "?",
-                "modified": parts[4] if len(parts) > 4 else "?",
-                "accessed": parts[5] if len(parts) > 5 else "?",
-                "type": parts[6] if len(parts) > 6 else "?",
-            })
+            return json.dumps(
+                {
+                    "path": path,
+                    "size_bytes": parts[0] if len(parts) > 0 else "?",
+                    "permissions": parts[1] if len(parts) > 1 else "?",
+                    "owner": parts[2] if len(parts) > 2 else "?",
+                    "group": parts[3] if len(parts) > 3 else "?",
+                    "modified": parts[4] if len(parts) > 4 else "?",
+                    "accessed": parts[5] if len(parts) > 5 else "?",
+                    "type": parts[6] if len(parts) > 6 else "?",
+                }
+            )
         finally:
             pool.release(conn)
 
@@ -241,7 +252,7 @@ def register(mcp: FastMCP):
                 return json.dumps({"error": f"Refusing to delete protected path: {path}"})
             result = await conn.run_full(f"rm {flag} {shlex.quote(path)}")
             if result.ok:
-                return json.dumps({"status": "ok", "deleted": path})
+                return json.dumps({"status": "ok", "operation": "delete", "path": path})
             return json.dumps({"error": result.stderr.strip()})
         finally:
             pool.release(conn)
@@ -408,12 +419,14 @@ def register(mcp: FastMCP):
                 return json.dumps({"error": "Pattern not found", "path": path})
             cmd = f"sed -i 's/{safe_pat}/{safe_rep}/g' {shlex.quote(path)} 2>&1"
             result = await conn.run_full(cmd, timeout=15)
-            return json.dumps({
-                "status": "ok" if result.ok else "error",
-                "path": path,
-                "matches_replaced": count,
-                "error": result.stderr.strip() if not result.ok else None,
-            })
+            return json.dumps(
+                {
+                    "status": "ok" if result.ok else "error",
+                    "path": path,
+                    "matches_replaced": count,
+                    "error": result.stderr.strip() if not result.ok else None,
+                }
+            )
         finally:
             pool.release(conn)
 
@@ -431,12 +444,14 @@ def register(mcp: FastMCP):
             if not result.ok:
                 return json.dumps({"error": result.stderr.strip()})
             parts = result.stdout.strip().split()
-            return json.dumps({
-                "path": path,
-                "lines": int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else None,
-                "words": int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None,
-                "chars": int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None,
-            })
+            return json.dumps(
+                {
+                    "path": path,
+                    "lines": int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else None,
+                    "words": int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None,
+                    "chars": int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None,
+                }
+            )
         finally:
             pool.release(conn)
 

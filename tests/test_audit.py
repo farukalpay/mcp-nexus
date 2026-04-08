@@ -1,7 +1,8 @@
 """Tests for audit logging."""
 
 import time
-from mcp_nexus.middleware.audit import AuditLog, AuditEntry
+
+from mcp_nexus.middleware.audit import AuditEntry, AuditLog
 
 
 def test_audit_record():
@@ -23,14 +24,16 @@ def test_audit_record():
 def test_audit_stats():
     log = AuditLog(max_entries=100)
     for i in range(10):
-        log.record(AuditEntry(
-            timestamp=time.time(),
-            tool="execute_command" if i % 2 == 0 else "read_file",
-            client_id="test",
-            args={},
-            success=i != 5,
-            duration_ms=float(i * 10),
-        ))
+        log.record(
+            AuditEntry(
+                timestamp=time.time(),
+                tool="execute_command" if i % 2 == 0 else "read_file",
+                client_id="test",
+                args={},
+                success=i != 5,
+                duration_ms=float(i * 10),
+            )
+        )
     stats = log.stats()
     assert stats["total"] == 10
     assert stats["errors"] == 1

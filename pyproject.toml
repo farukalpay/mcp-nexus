@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-nexus"
-version = "1.1.0"
+version = "1.2.0"
 description = "Remote server management through MCP with built-in intelligence — the AI learns how you work."
 readme = "README.md"
 license = {text = "MIT"}

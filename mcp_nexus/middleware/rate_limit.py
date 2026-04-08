@@ -32,12 +32,14 @@ class RateLimiter:
     def __init__(self, rpm: int = 120, burst: int = 20):
         self._rpm = rpm
         self._burst = burst
-        self._buckets: dict[str, Bucket] = defaultdict(lambda: Bucket(
-            tokens=float(burst),
-            last_refill=time.monotonic(),
-            max_tokens=float(burst),
-            refill_rate=rpm / 60.0,
-        ))
+        self._buckets: dict[str, Bucket] = defaultdict(
+            lambda: Bucket(
+                tokens=float(burst),
+                last_refill=time.monotonic(),
+                max_tokens=float(burst),
+                refill_rate=rpm / 60.0,
+            )
+        )
 
     def allow(self, client_id: str = "default") -> bool:
         return self._buckets[client_id].consume()

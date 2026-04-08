@@ -8,18 +8,39 @@
 
 set -euo pipefail
 
-HOST="${1:?Usage: deploy-to-server.sh <SSH_HOST> [SSH_USER] [SSH_PORT]}"
-USER="${2:-root}"
-PORT="${3:-22}"
-REMOTE_DIR="/root/mcp-nexus"
+if [ -f ".env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
 
-SSH="ssh -o StrictHostKeyChecking=no -p $PORT $USER@$HOST"
-SCP="scp -o StrictHostKeyChecking=no -P $PORT"
+HOST="${1:-${NEXUS_SSH_HOST:-}}"
+USER="${2:-${NEXUS_SSH_USER:-root}}"
+PORT="${3:-${NEXUS_SSH_PORT:-22}}"
+REMOTE_DIR="${NEXUS_DEPLOY_REMOTE_DIR:-/root/mcp-nexus}"
+
+if [ -z "$HOST" ]; then
+    echo "Usage: deploy-to-server.sh <SSH_HOST> [SSH_USER] [SSH_PORT]" >&2
+    echo "Or set NEXUS_SSH_HOST in .env" >&2
+    exit 1
+fi
+
+SSH_OPTS=(-o StrictHostKeyChecking=no -p "$PORT")
+if [ -n "${NEXUS_SSH_KEY_PATH:-}" ]; then
+    SSH_OPTS+=(-i "$NEXUS_SSH_KEY_PATH")
+fi
+
+SSH=(ssh "${SSH_OPTS[@]}" "$USER@$HOST")
+SCP=(scp -o StrictHostKeyChecking=no -P "$PORT")
+if [ -n "${NEXUS_SSH_KEY_PATH:-}" ]; then
+    SCP+=(-i "$NEXUS_SSH_KEY_PATH")
+fi
 
 echo "━━━ Deploying MCP Nexus to $USER@$HOST:$PORT ━━━"
 
 # 1. Create remote directory
-$SSH "mkdir -p $REMOTE_DIR"
+"${SSH[@]}" "mkdir -p $REMOTE_DIR"
 
 # 2. Sync code (excluding .env, .git, __pycache__)
 rsync -avz --delete \
@@ -30,26 +51,37 @@ rsync -avz --delete \
     --exclude='.venv' \
     --exclude='node_modules' \
     --exclude='.DS_Store' \
-    -e "ssh -o StrictHostKeyChecking=no -p $PORT" \
+    --exclude='._*' \
+    --exclude='.pytest_cache' \
+    --exclude='.mypy_cache' \
+    --exclude='.ruff_cache' \
+    --exclude='*.egg-info' \
+    -e "ssh ${NEXUS_SSH_KEY_PATH:+-i $NEXUS_SSH_KEY_PATH }-o StrictHostKeyChecking=no -p $PORT" \
     ./ "$USER@$HOST:$REMOTE_DIR/"
 
 echo "✓ Code synced"
 
 # 3. Setup venv & install
-$SSH "cd $REMOTE_DIR && python3 -m venv .venv && .venv/bin/pip install -q -e ."
+"${SSH[@]}" "cd $REMOTE_DIR && python3 -m venv .venv && .venv/bin/pip install -q -e ."
 echo "✓ Dependencies installed"
+
+if [ -z "${NEXUS_PUBLIC_BASE_URL:-}" ]; then
+    echo "⚠ NEXUS_PUBLIC_BASE_URL is not set. ChatGPT Connect / OAuth discovery routes will not be externally advertised."
+fi
 
 # 4. Copy .env if it exists locally and not on remote
 if [ -f ".env" ]; then
-    $SSH "test -f $REMOTE_DIR/.env" 2>/dev/null || $SCP .env "$USER@$HOST:$REMOTE_DIR/.env"
+    "${SSH[@]}" "test -f $REMOTE_DIR/.env" 2>/dev/null || "${SCP[@]}" .env "$USER@$HOST:$REMOTE_DIR/.env"
 fi
 
 # 5. Create systemd service
-$SSH "cat > /etc/systemd/system/mcp-nexus.service << 'UNIT'
+"${SSH[@]}" "cat > /etc/systemd/system/mcp-nexus.service << 'UNIT'
 [Unit]
 Description=MCP Nexus — Remote Server Management via MCP
 After=network.target
 Wants=network-online.target
+StartLimitBurst=10
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -58,8 +90,6 @@ WorkingDirectory=$REMOTE_DIR
 ExecStart=$REMOTE_DIR/.venv/bin/python -m mcp_nexus serve --host 127.0.0.1 --port 8766
 Restart=always
 RestartSec=3
-StartLimitBurst=10
-StartLimitIntervalSec=120
 OOMScoreAdjust=-500
 LimitNOFILE=65535
 StandardOutput=journal
@@ -73,7 +103,7 @@ UNIT"
 echo "✓ Systemd service created"
 
 # 6. Add nginx location block (if nginx exists)
-$SSH "if command -v nginx &>/dev/null; then
+"${SSH[@]}" "if command -v nginx &>/dev/null; then
     # Check if the location block already exists
     if ! grep -q 'mcp/nexus' /etc/nginx/sites-enabled/* 2>/dev/null; then
         echo '
@@ -92,8 +122,33 @@ $SSH "if command -v nginx &>/dev/null; then
         proxy_buffering off;
     }
 
+    # Legacy MCP path compatibility
+    location /mcp {
+        proxy_pass http://127.0.0.1:8766/mcp/nexus;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_buffering off;
+    }
+
     location /health/nexus {
         proxy_pass http://127.0.0.1:8766/health;
+        proxy_read_timeout 5s;
+    }
+
+    location /ready/nexus {
+        proxy_pass http://127.0.0.1:8766/ready;
+        proxy_read_timeout 5s;
+    }
+
+    location /version/nexus {
+        proxy_pass http://127.0.0.1:8766/version;
         proxy_read_timeout 5s;
     }
 
@@ -102,8 +157,67 @@ $SSH "if command -v nginx &>/dev/null; then
         proxy_read_timeout 5s;
     }
 
-    location /oauth/token {
+    location = /.well-known/oauth-authorization-server {
+        proxy_pass http://127.0.0.1:8766/.well-known/oauth-authorization-server;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /.well-known/oauth-protected-resource/ {
+        proxy_pass http://127.0.0.1:8766/.well-known/oauth-protected-resource/;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /authorize {
+        proxy_pass http://127.0.0.1:8766/authorize;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /token {
+        proxy_pass http://127.0.0.1:8766/token;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /register {
+        proxy_pass http://127.0.0.1:8766/register;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /oauth/consent {
+        proxy_pass http://127.0.0.1:8766/oauth/consent;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /oauth/token {
         proxy_pass http://127.0.0.1:8766/oauth/token;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_read_timeout 10s;
     }' >> /tmp/nexus_nginx_snippet.txt
         echo '→ Nginx snippet saved to /tmp/nexus_nginx_snippet.txt'
@@ -112,12 +226,12 @@ $SSH "if command -v nginx &>/dev/null; then
 fi"
 
 # 7. Enable and start
-$SSH "systemctl daemon-reload && systemctl enable mcp-nexus && systemctl restart mcp-nexus"
+"${SSH[@]}" "systemctl daemon-reload && systemctl enable mcp-nexus && systemctl restart mcp-nexus"
 echo "✓ Service started"
 
 # 8. Verify
 sleep 2
-$SSH "systemctl is-active mcp-nexus && echo '✓ MCP Nexus is running' || echo '✗ Service failed to start'"
+"${SSH[@]}" "systemctl is-active mcp-nexus && echo '✓ MCP Nexus is running' || echo '✗ Service failed to start'"
 
 echo
 echo "━━━ Deployment complete ━━━"
