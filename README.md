@@ -18,10 +18,6 @@
     <a href="#configuration">Config</a>
   </p>
   <p align="center">
-    <img src="https://img.shields.io/pypi/v/mcp-nexus?color=6366f1&style=flat-square" alt="PyPI"/>
-    <img src="https://img.shields.io/pypi/pyversions/mcp-nexus?style=flat-square" alt="Python"/>
-    <img src="https://img.shields.io/github/license/lightcap-ai/mcp-nexus?style=flat-square" alt="License"/>
-    <img src="https://img.shields.io/github/actions/workflow/status/lightcap-ai/mcp-nexus/ci.yml?style=flat-square&label=CI" alt="CI"/>
   </p>
 </p>
 
