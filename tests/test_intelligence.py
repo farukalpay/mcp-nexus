@@ -26,6 +26,7 @@ async def test_record_interaction(memory):
     ctx = await memory.get_context()
     assert ctx["recent_actions"][0]["tool"] == "read_file"
     assert ctx["recent_actions"][0]["ok"] is True
+    assert ctx["recent_actions"][0]["after"]["ok"] is True
 
 
 @pytest.mark.asyncio
@@ -45,9 +46,9 @@ async def test_preference_learning(memory):
         await memory.record("git_status", {"repo_path": "/my/repo"}, True, 10.0)
 
     prefs = await memory.get_preferences()
-    assert "default_repo" in prefs
-    assert prefs["default_repo"]["value"] == "/my/repo"
-    assert prefs["default_repo"]["confidence"] >= 0.7
+    assert "arg:repo_path" in prefs
+    assert prefs["arg:repo_path"]["value"] == "/my/repo"
+    assert prefs["arg:repo_path"]["confidence"] >= 0.9
 
 
 @pytest.mark.asyncio
@@ -73,6 +74,7 @@ async def test_insights(memory):
     assert insights["totals"]["errors"] == 1
     assert "read_file" in insights["top_tools"]
     assert insights["top_tools"]["read_file"] == 2
+    assert insights["learning"]["model"]["type"] == "online_softmax_ranker"
 
 
 @pytest.mark.asyncio
@@ -100,6 +102,32 @@ async def test_error_tracking(memory):
     ctx = await memory.get_context()
     assert len(ctx["recent_errors"]) == 1
     assert ctx["recent_errors"][0]["tool"] == "db_query"
+
+
+@pytest.mark.asyncio
+async def test_context_exposes_short_and_long_term_memory(memory):
+    await memory.record("git_status", {"repo_path": "/srv/app"}, True, 11.0)
+    await memory.record("git_diff", {"repo_path": "/srv/app"}, True, 9.0)
+
+    ctx = await memory.get_context()
+    assert ctx["short_term_memory"]["recent_actions"][0]["tool"] == "git_diff"
+    assert ctx["short_term_memory"]["recent_actions"][0]["before"]["previous_tool"] == "git_status"
+    assert "arg:repo_path" in ctx["long_term_memory"]["preferences"]
+    assert ctx["long_term_memory"]["learning"]["model"]["type"] == "online_softmax_ranker"
+
+
+@pytest.mark.asyncio
+async def test_suggestions_downrank_unreliable_transitions(memory):
+    for _ in range(4):
+        await memory.record("git_status", {}, True, 5.0)
+        await memory.record("git_diff", {}, True, 5.0)
+        await memory.record("git_status", {}, True, 5.0)
+        await memory.record("git_push", {}, False, 5.0)
+
+    suggestions = await memory.suggest_next("git_status")
+    assert suggestions[0]["tool"] == "git_diff"
+    by_tool = {item["tool"]: item for item in suggestions}
+    assert by_tool["git_diff"]["expected_success_rate"] > by_tool["git_push"]["expected_success_rate"]
 
 
 @pytest.mark.asyncio

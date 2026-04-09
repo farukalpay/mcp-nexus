@@ -295,6 +295,7 @@ class Settings:
     artifact_root: str = field(default_factory=lambda: _env("NEXUS_ARTIFACT_ROOT", "~/.mcp-nexus/artifacts"))
     job_root: str = field(default_factory=lambda: _env("NEXUS_JOB_ROOT", "/var/tmp/mcp-nexus/jobs"))
     tool_alias_base: str = field(default_factory=lambda: _env("NEXUS_TOOL_ALIAS_BASE", "/mcp-nexus"))
+    analysis_thread_limit: int = field(default_factory=lambda: _env_int("NEXUS_ANALYSIS_THREAD_LIMIT", 1))
     forwarded_headers: list[str] = field(
         default_factory=lambda: _env_list(
             "NEXUS_FORWARDED_HEADERS",

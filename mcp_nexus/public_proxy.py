@@ -17,6 +17,10 @@ else:
 DEFAULT_PUBLIC_PROXY_PATH_PREFIXES: tuple[str, ...] = (
     "/mcp",
     "/mcp/nexus",
+    "/mcp-nexus",
+    "/tool-registry",
+    "/tool-registry/nexus",
+    "/.well-known/nexus-tool-registry",
     "/authorize",
     "/token",
     "/register",

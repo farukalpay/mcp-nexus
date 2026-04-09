@@ -17,6 +17,11 @@ def test_normalize_public_proxy_prefixes_deduplicates_and_normalizes() -> None:
 
 def test_should_proxy_public_path_matches_exact_and_nested_paths() -> None:
     assert should_proxy_public_path("/mcp/nexus")
+    assert should_proxy_public_path("/mcp-nexus/web_retrieve")
+    assert should_proxy_public_path("/mcp-nexus/runtime/instance-1/web_retrieve")
+    assert should_proxy_public_path("/tool-registry")
+    assert should_proxy_public_path("/tool-registry/nexus")
+    assert should_proxy_public_path("/.well-known/nexus-tool-registry")
     assert should_proxy_public_path("/.well-known/oauth-protected-resource/mcp/nexus")
     assert should_proxy_public_path("/oauth/consent")
     assert should_proxy_public_path("/oauth/consent/assets")
@@ -26,6 +31,10 @@ def test_should_proxy_public_path_matches_exact_and_nested_paths() -> None:
 def test_default_public_proxy_prefixes_cover_required_oauth_surface() -> None:
     required = {
         "/mcp/nexus",
+        "/mcp-nexus",
+        "/tool-registry",
+        "/tool-registry/nexus",
+        "/.well-known/nexus-tool-registry",
         "/authorize",
         "/token",
         "/register",

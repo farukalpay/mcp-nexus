@@ -43,6 +43,7 @@ CURRENT_BIND_HOST="$("${SSH[@]}" "systemctl cat mcp-nexus --no-pager 2>/dev/null
 CURRENT_BIND_PORT="$("${SSH[@]}" "systemctl cat mcp-nexus --no-pager 2>/dev/null | sed -n 's/.*--port \\([0-9][0-9]*\\).*/\\1/p' | tail -n1" || true)"
 BIND_HOST="${NEXUS_DEPLOY_BIND_HOST:-${CURRENT_BIND_HOST:-127.0.0.1}}"
 BIND_PORT="${NEXUS_DEPLOY_BIND_PORT:-${CURRENT_BIND_PORT:-${NEXUS_PORT:-8766}}}"
+TOOL_ALIAS_BASE="${NEXUS_TOOL_ALIAS_BASE:-/mcp-nexus}"
 
 # 1. Create remote directory
 "${SSH[@]}" "mkdir -p $REMOTE_DIR"
@@ -51,6 +52,7 @@ BIND_PORT="${NEXUS_DEPLOY_BIND_PORT:-${CURRENT_BIND_PORT:-${NEXUS_PORT:-8766}}}"
 rsync -avz --delete \
     --exclude='.env' \
     --exclude='.git' \
+    --exclude='.mcp-nexus' \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     --exclude='.venv' \
@@ -109,8 +111,11 @@ echo "✓ Systemd service created"
 
 # 6. Add nginx location block (if nginx exists)
 "${SSH[@]}" "if command -v nginx &>/dev/null; then
-    # Check if the location block already exists
-    if ! grep -q 'mcp/nexus' /etc/nginx/sites-enabled/* 2>/dev/null; then
+    # Surface the latest proxy snippet when the public config is missing any required Nexus routes.
+    if ! grep -q 'mcp/nexus' /etc/nginx/sites-enabled/* 2>/dev/null || \
+       ! grep -q '${TOOL_ALIAS_BASE#"/"}' /etc/nginx/sites-enabled/* 2>/dev/null || \
+       ! grep -q 'tool-registry/nexus' /etc/nginx/sites-enabled/* 2>/dev/null || \
+       ! grep -q '/.well-known/nexus-tool-registry' /etc/nginx/sites-enabled/* 2>/dev/null; then
         echo '
     # MCP Nexus
     location /mcp/nexus {
@@ -142,6 +147,19 @@ echo "✓ Systemd service created"
         proxy_buffering off;
     }
 
+    # Stable HTTP tool-alias surface from the Nexus registry (optional caller fallback).
+    location ${TOOL_ALIAS_BASE} {
+        proxy_pass http://127.0.0.1:$BIND_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_buffering off;
+    }
+
     location /health/nexus {
         proxy_pass http://127.0.0.1:$BIND_PORT/health;
         proxy_read_timeout 5s;
@@ -159,6 +177,36 @@ echo "✓ Systemd service created"
 
     location /info/nexus {
         proxy_pass http://127.0.0.1:$BIND_PORT/info;
+        proxy_read_timeout 5s;
+    }
+
+    location /tool-registry {
+        proxy_pass http://127.0.0.1:$BIND_PORT/tool-registry;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 5s;
+    }
+
+    location /tool-registry/nexus {
+        proxy_pass http://127.0.0.1:$BIND_PORT/tool-registry/nexus;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 5s;
+    }
+
+    location = /.well-known/nexus-tool-registry {
+        proxy_pass http://127.0.0.1:$BIND_PORT/.well-known/nexus-tool-registry;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_read_timeout 5s;
     }
 

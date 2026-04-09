@@ -22,6 +22,7 @@ def test_parse_capability_output():
             "supports_resource_limits=1",
             "cmd_rg=1",
             "cmd_git=1",
+            "cmd_chromium=1",
         ]
     )
 
@@ -33,6 +34,7 @@ def test_parse_capability_output():
     assert capabilities.supports_resource_limits is True
     assert capabilities.has("rg") is True
     assert capabilities.has("git") is True
+    assert capabilities.has("chromium") is True
 
 
 def test_extract_execution_metadata():

@@ -372,6 +372,7 @@ Nexus now separates stable registry generation from live session binding:
 - every process gets a `server_instance_id`
 - every tool snapshot gets a `registry_version`
 - every tool exposes a stable alias like `/mcp-nexus/db_query`
+- stable and runtime alias paths are callable over HTTP (`GET` with query params or `POST` JSON body)
 - runtime binding details are attached as `resolved_runtime_id` metadata
 
 For debugging registry drift and session issues, the HTTP server exposes:
@@ -382,6 +383,10 @@ For debugging registry drift and session issues, the HTTP server exposes:
 - `/tool-registry`
 - `/sessions`
 - `/session/{id}`
+- `/mcp-nexus/{tool_name}`
+- `/mcp-nexus/runtime/{server_instance_id}/{tool_name}`
+
+When OAuth is enabled, HTTP tool-alias invocation requires a valid bearer token.
 
 The same metadata is also available through MCP resources:
 
@@ -747,7 +752,7 @@ The bundled compose file now does two extra things on purpose:
 
 Creates a systemd service with auto-restart + nginx reverse proxy snippet. If `.env` already contains `NEXUS_SSH_HOST`, `NEXUS_SSH_USER`, `NEXUS_SSH_PORT`, or `NEXUS_SSH_KEY_PATH`, the script will use them automatically when arguments are omitted.
 
-The generated nginx snippet now includes `/mcp/nexus`, `/mcp`, `/health/nexus`, `/ready/nexus`, and `/version/nexus` so legacy clients and new diagnostics can coexist cleanly.
+The generated nginx snippet now includes `/mcp/nexus`, `/mcp`, `/mcp-nexus`, `/health/nexus`, `/ready/nexus`, and `/version/nexus` so legacy clients and new diagnostics can coexist cleanly.
 
 If your domain is already served by another frontend application, do not let those OAuth and MCP paths fall through to the website router. Route them to MCP Nexus on the same public origin or ChatGPT Connect will fail.
 

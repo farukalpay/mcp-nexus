@@ -138,6 +138,9 @@ for pair in \
   stdbuf:stdbuf \
   ss:ss netstat:netstat lsof:lsof nc:nc socat:socat iptables:iptables \
   ufw:ufw journalctl:journalctl dig:dig openssl:openssl curl:curl \
+  chromium:chromium chromium_browser:chromium-browser \
+  google_chrome:google-chrome google_chrome_stable:google-chrome-stable firefox:firefox \
+  playwright:playwright npx:npx \
   psql:psql mysql:mysql sqlite3:sqlite3 npm:npm pip3:pip3 pip:pip \
   node:node pytest:pytest ruff:ruff mypy:mypy pyright:pyright docker-compose:docker_compose
 do

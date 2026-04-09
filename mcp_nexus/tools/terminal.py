@@ -10,6 +10,12 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from mcp_nexus.python_execution import (
+    python_inline_wrapper,
+    python_run_path_wrapper,
+    secret_file_env_var,
+    write_secret_file,
+)
 from mcp_nexus.python_sandbox import (
     ensure_python_sandbox,
     sandbox_root,
@@ -20,6 +26,7 @@ from mcp_nexus.python_sandbox import (
 from mcp_nexus.results import ToolResult, build_tool_result, preview_text
 from mcp_nexus.runtime import ExecutionLimits, ExecutionRequest, build_managed_command, extract_execution_metadata
 from mcp_nexus.server import get_artifacts, get_pool, get_settings, tool_context
+from mcp_nexus.task_routing import ToolRedirect, terminal_specialized_redirect
 from mcp_nexus.transport.ssh import CommandResult
 
 
@@ -41,6 +48,20 @@ def _stdin_script_command(interpreter: str, script: str, *, stdin_flag: str = ""
     marker = _unique_heredoc_marker(script, prefix="NEXUS_SCRIPT_EOF")
     stdin_suffix = f" {stdin_flag}" if stdin_flag else ""
     return f"{shlex.quote(interpreter)}{stdin_suffix} <<'{marker}'\n{script}\n{marker}"
+
+
+def _stdin_script_argv_command(
+    interpreter: str,
+    script: str,
+    *,
+    args: list[str] | None = None,
+    stdin_flag: str = "",
+) -> str:
+    marker = _unique_heredoc_marker(script, prefix="NEXUS_SCRIPT_EOF")
+    argv = " ".join(shlex.quote(arg) for arg in (args or []))
+    stdin_suffix = f" {stdin_flag}" if stdin_flag else ""
+    argv_suffix = f" {argv}" if argv else ""
+    return f"{shlex.quote(interpreter)}{stdin_suffix}{argv_suffix} <<'{marker}'\n{script}\n{marker}"
 
 
 def _argv_command(program: str, args: list[str] | None = None) -> str:
@@ -211,17 +232,32 @@ def _result(
     )
 
 
-async def _resolve_database_env(
+def _redirect_result(tool_name: str, redirect: ToolRedirect, *, duration_ms: float) -> ToolResult:
+    return _result(
+        tool_name,
+        ok=False,
+        duration_ms=duration_ms,
+        error_code="SPECIALIZED_TOOL_REQUIRED",
+        error_stage="validation",
+        message=(
+            f"This request matches {redirect.task_family} and should use "
+            f"{redirect.recommended_tool} instead of {tool_name}."
+        ),
+        data={"redirect": redirect.to_dict()},
+    )
+
+
+async def _resolve_database_binding(
     tool_name: str,
     *,
     started: float,
     database_profile: str = "",
     database: str = "",
     db_env_var: str = "",
-) -> tuple[dict[str, str] | None, ToolResult | None]:
+) -> tuple[tuple[str, str] | None, ToolResult | None]:
     wants_db_env = bool(database_profile.strip() or database.strip() or db_env_var.strip())
     if not wants_db_env:
-        return {}, None
+        return None, None
 
     settings = get_settings()
     profile_name = database_profile.strip()
@@ -255,7 +291,30 @@ async def _resolve_database_env(
             ),
         )
 
-    return {db_env_var.strip() or "NEXUS_DB_URI": resolved.dsn}, None
+    return (db_env_var.strip() or "NEXUS_DB_URI", resolved.dsn), None
+
+
+async def _resolve_database_env(
+    tool_name: str,
+    *,
+    started: float,
+    database_profile: str = "",
+    database: str = "",
+    db_env_var: str = "",
+) -> tuple[dict[str, str] | None, ToolResult | None]:
+    binding, error = await _resolve_database_binding(
+        tool_name,
+        started=started,
+        database_profile=database_profile,
+        database=database,
+        db_env_var=db_env_var,
+    )
+    if error:
+        return None, error
+    if binding is None:
+        return {}, None
+    env_var, dsn = binding
+    return {env_var: dsn}, None
 
 
 def register(mcp: FastMCP):
@@ -277,6 +336,9 @@ def register(mcp: FastMCP):
     ) -> ToolResult:
         """Execute a shell command with structured stdout/stderr and artifact fallbacks."""
         started = time.monotonic()
+        redirect = terminal_specialized_redirect("execute_command", command=command)
+        if redirect is not None:
+            return _redirect_result("execute_command", redirect, duration_ms=(time.monotonic() - started) * 1000)
         database_env, env_error = await _resolve_database_env(
             "execute_command",
             started=started,
@@ -344,6 +406,9 @@ def register(mcp: FastMCP):
     ) -> ToolResult:
         """Execute a sequence of shell commands with structured per-step results."""
         started = time.monotonic()
+        redirect = terminal_specialized_redirect("execute_batch", commands=commands)
+        if redirect is not None:
+            return _redirect_result("execute_batch", redirect, duration_ms=(time.monotonic() - started) * 1000)
         settings = get_settings()
         if not commands:
             return _result(
@@ -585,8 +650,15 @@ def register(mcp: FastMCP):
         memory_limit_mb: int = 0,
     ) -> ToolResult:
         """Execute a multi-line script through the chosen interpreter."""
-        command = _stdin_script_command(interpreter, script)
         started = time.monotonic()
+        redirect = terminal_specialized_redirect(
+            "execute_script",
+            script=script,
+            interpreter=interpreter,
+        )
+        if redirect is not None:
+            return _redirect_result("execute_script", redirect, duration_ms=(time.monotonic() - started) * 1000)
+        command = _stdin_script_command(interpreter, script)
         database_env, env_error = await _resolve_database_env(
             "execute_script",
             started=started,
@@ -651,9 +723,11 @@ def register(mcp: FastMCP):
         """Execute Python code on the connected target without embedding raw credentials in the code."""
         runtime_env = dict(env or {})
         sandbox_info: dict[str, Any] | None = None
-        python_bin = "python3"
         started = time.monotonic()
-        database_env, env_error = await _resolve_database_env(
+        redirect = terminal_specialized_redirect("execute_python", code=code)
+        if redirect is not None:
+            return _redirect_result("execute_python", redirect, duration_ms=(time.monotonic() - started) * 1000)
+        database_binding, env_error = await _resolve_database_binding(
             "execute_python",
             started=started,
             database_profile=database_profile,
@@ -662,28 +736,24 @@ def register(mcp: FastMCP):
         )
         if env_error:
             return env_error
-        runtime_env.update(database_env or {})
 
         pool = get_pool()
         conn = await pool.acquire()
+        db_secret_path = ""
         try:
             capabilities = await conn.probe_capabilities()
-        finally:
-            pool.release(conn)
+            if not capabilities.python_command:
+                return _result(
+                    "execute_python",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    error_code="PYTHON_UNAVAILABLE",
+                    error_stage="capability_probe",
+                    message="Python is not available on the target host.",
+                    data={"capabilities": capabilities.to_dict()},
+                )
+            python_bin = capabilities.python_command
 
-        if not capabilities.python_command:
-            return _result(
-                "execute_python",
-                ok=False,
-                duration_ms=(time.monotonic() - started) * 1000,
-                error_code="PYTHON_UNAVAILABLE",
-                error_stage="capability_probe",
-                message="Python is not available on the target host.",
-                data={"capabilities": capabilities.to_dict()},
-            )
-        python_bin = capabilities.python_command
-
-        try:
             if sandbox_path or requirements:
                 sandbox_info, _ = await ensure_python_sandbox(
                     sandbox_path_value=sandbox_path or build_sandbox_path(name="python"),
@@ -695,7 +765,19 @@ def register(mcp: FastMCP):
                 runtime_env["PATH"] = f"{sandbox_root}/bin:$PATH"
 
             command = _stdin_script_command(python_bin, code, stdin_flag="-")
-            result, usage, capability_data, duration_ms = await _run_execution(
+            if database_binding is not None:
+                db_env_name, dsn = database_binding
+                db_secret_path = await write_secret_file(conn, prefix="execute-python-db", content=dsn)
+                runtime_env[secret_file_env_var(db_env_name)] = db_secret_path
+                command = _stdin_script_command(
+                    python_bin,
+                    python_inline_wrapper(code, db_env_var=db_env_name),
+                    stdin_flag="-",
+                )
+
+            result, usage, capability_data, duration_ms = await _run_execution_on_connection(
+                conn,
+                capabilities=capabilities,
                 command=command,
                 cwd=cwd,
                 timeout=timeout,
@@ -715,6 +797,10 @@ def register(mcp: FastMCP):
                 message="Failed to prepare Python execution.",
                 data={"sandbox": sandbox_info},
             )
+        finally:
+            if db_secret_path:
+                await conn.run_full(f"rm -f {shlex.quote(db_secret_path)}", timeout=20)
+            pool.release(conn)
 
         error_code, error_stage = _error_code_for_result(result)
         return _result(
@@ -731,6 +817,7 @@ def register(mcp: FastMCP):
                 "capabilities": capability_data,
                 "sandbox": sandbox_info,
                 "cwd": _safe_cwd(cwd) or None,
+                "database_delivery": "secret_file" if database_binding is not None else None,
             },
             usage=usage,
         )
@@ -765,7 +852,7 @@ def register(mcp: FastMCP):
 
         runtime_env = dict(env or {})
         sandbox_info: dict[str, Any] | None = None
-        database_env, env_error = await _resolve_database_env(
+        database_binding, env_error = await _resolve_database_binding(
             "execute_python_file",
             started=started,
             database_profile=database_profile,
@@ -774,28 +861,24 @@ def register(mcp: FastMCP):
         )
         if env_error:
             return env_error
-        runtime_env.update(database_env or {})
 
         pool = get_pool()
         conn = await pool.acquire()
+        db_secret_path = ""
         try:
             capabilities = await conn.probe_capabilities()
-        finally:
-            pool.release(conn)
+            if not capabilities.python_command:
+                return _result(
+                    "execute_python_file",
+                    ok=False,
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    error_code="PYTHON_UNAVAILABLE",
+                    error_stage="capability_probe",
+                    message="Python is not available on the target host.",
+                    data={"capabilities": capabilities.to_dict()},
+                )
 
-        if not capabilities.python_command:
-            return _result(
-                "execute_python_file",
-                ok=False,
-                duration_ms=(time.monotonic() - started) * 1000,
-                error_code="PYTHON_UNAVAILABLE",
-                error_stage="capability_probe",
-                message="Python is not available on the target host.",
-                data={"capabilities": capabilities.to_dict()},
-            )
-
-        python_bin = capabilities.python_command
-        try:
+            python_bin = capabilities.python_command
             if sandbox_path or requirements:
                 sandbox_info, _ = await ensure_python_sandbox(
                     sandbox_path_value=sandbox_path or build_sandbox_path(name="python"),
@@ -806,8 +889,22 @@ def register(mcp: FastMCP):
                 runtime_env["VIRTUAL_ENV"] = sandbox_root
                 runtime_env["PATH"] = f"{sandbox_root}/bin:$PATH"
 
-            result, usage, capability_data, duration_ms = await _run_execution(
-                command=_argv_command(python_bin, [path, *(args or [])]),
+            command = _argv_command(python_bin, [path, *(args or [])])
+            if database_binding is not None:
+                db_env_name, dsn = database_binding
+                db_secret_path = await write_secret_file(conn, prefix="execute-python-file-db", content=dsn)
+                runtime_env[secret_file_env_var(db_env_name)] = db_secret_path
+                command = _stdin_script_argv_command(
+                    python_bin,
+                    python_run_path_wrapper(db_env_var=db_env_name),
+                    args=[path, *(args or [])],
+                    stdin_flag="-",
+                )
+
+            result, usage, capability_data, duration_ms = await _run_execution_on_connection(
+                conn,
+                capabilities=capabilities,
+                command=command,
                 cwd=cwd,
                 timeout=timeout,
                 env=runtime_env,
@@ -826,6 +923,10 @@ def register(mcp: FastMCP):
                 message="Failed to prepare Python file execution.",
                 data={"sandbox": sandbox_info, "path": path},
             )
+        finally:
+            if db_secret_path:
+                await conn.run_full(f"rm -f {shlex.quote(db_secret_path)}", timeout=20)
+            pool.release(conn)
 
         error_code, error_stage = _error_code_for_result(result)
         return _result(
@@ -844,6 +945,7 @@ def register(mcp: FastMCP):
                 "cwd": _safe_cwd(cwd) or None,
                 "path": path,
                 "args": args or [],
+                "database_delivery": "secret_file" if database_binding is not None else None,
             },
             usage=usage,
         )

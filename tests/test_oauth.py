@@ -87,6 +87,76 @@ def test_health_alias_route_exists():
         assert response.status_code == 200
 
 
+def test_tool_registry_alias_routes_exist():
+    app = create_app(_oauth_settings(), enable_watchdog=False)
+
+    with TestClient(app) as client:
+        alias_response = client.get("/tool-registry/nexus")
+        well_known_response = client.get("/.well-known/nexus-tool-registry")
+        assert alias_response.status_code == 200
+        assert well_known_response.status_code == 200
+        assert alias_response.json()["tool_count"] == well_known_response.json()["tool_count"]
+
+
+def test_tool_alias_routes_require_bearer_and_support_runtime_binding():
+    app = create_app(_oauth_settings(), enable_watchdog=False)
+
+    with TestClient(app, base_url="https://example.com") as client:
+        unauthorized = client.post("/mcp-nexus/nexus_tool_catalog", json={})
+        assert unauthorized.status_code == 401
+        assert unauthorized.json()["error_code"] == "AUTH_REQUIRED"
+
+        token_response = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": "127.0.0.1",
+                "client_secret": "",
+                "ssh_user": "root",
+                "ssh_port": "22",
+            },
+        )
+        assert token_response.status_code == 200
+        token = token_response.json()["access_token"]
+
+        auth_headers = {"authorization": f"Bearer {token}"}
+        alias_response = client.post("/mcp-nexus/nexus_tool_catalog", json={}, headers=auth_headers)
+        assert alias_response.status_code == 200
+        alias_payload = alias_response.json()
+        assert alias_payload["ok"] is True
+        assert alias_payload["tool"]["name"] == "nexus_tool_catalog"
+        assert alias_payload["result"]["surface_scope"] == "server_catalog"
+
+        registry = client.get("/version/nexus").json()
+        server_instance_id = registry["server_instance_id"]
+        runtime_response = client.post(
+            f"/mcp-nexus/runtime/{server_instance_id}/nexus_tool_catalog",
+            json={},
+            headers=auth_headers,
+        )
+        assert runtime_response.status_code == 200
+
+        stale_response = client.post(
+            "/mcp-nexus/runtime/stale-instance/nexus_tool_catalog",
+            json={},
+            headers=auth_headers,
+        )
+        assert stale_response.status_code == 409
+        assert stale_response.json()["error_code"] == "SERVER_INSTANCE_MISMATCH"
+
+
+def test_version_exposes_control_plane_paths():
+    app = create_app(_oauth_settings(), enable_watchdog=False)
+
+    with TestClient(app) as client:
+        response = client.get("/version/nexus")
+        assert response.status_code == 200
+        payload = response.json()
+        assert "/tool-registry" in payload["control_plane"]["tool_registry"]
+        assert "/.well-known/nexus-tool-registry" in payload["control_plane"]["tool_registry"]
+        assert any(path.startswith("/mcp-nexus/") for path in payload["control_plane"]["tool_alias"])
+
+
 def test_mcp_browser_get_renders_connect_landing_without_breaking_auth_surface():
     app = create_app(_oauth_settings(), enable_watchdog=False)
 

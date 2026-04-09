@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mcp_nexus.catalog import catalog_summary, category_for_tool
+from mcp_nexus.catalog import catalog_summary, category_for_tool, task_family_handoff
 from mcp_nexus.tools.database import (
     DEFAULT_DB_CLIENT_MODULES,
     DEFAULT_DB_CLIENT_PACKAGES,
@@ -19,6 +19,7 @@ from mcp_nexus.tools.terminal import (
     _aggregate_batch_usage,
     _argv_command,
     _safe_cwd,
+    _stdin_script_argv_command,
     _stdin_script_command,
 )
 
@@ -123,14 +124,69 @@ def test_catalog_includes_new_deep_tools() -> None:
     assert category_for_tool("db_table_inspect") == "database"
     assert category_for_tool("tabular_dataset_profile") == "analysis"
     assert category_for_tool("train_tabular_classifier") == "analysis"
+    assert category_for_tool("web_retrieve") == "network"
+    assert category_for_tool("browser_bootstrap") == "network"
+    assert category_for_tool("browser_runtime_status") == "network"
+    assert category_for_tool("browser_screenshot") == "network"
+    assert category_for_tool("browser_coordinate_click") == "network"
+    assert category_for_tool("browser_fetch") == "network"
+    assert category_for_tool("web_page_diagnose") == "network"
+    assert category_for_tool("http_fetch") == "network"
+    assert category_for_tool("nexus_tool_registry") == "intelligence"
+    assert category_for_tool("nexus_tool_handoff") == "intelligence"
 
     summary = catalog_summary()
-    assert summary.total_tools == 163
+    assert summary.total_tools == 173
     assert summary.category_counts["terminal"] == 11
     assert summary.category_counts["git"] == 15
     assert summary.category_counts["filesystem"] == 20
     assert summary.category_counts["database"] == 22
+    assert summary.category_counts["network"] == 22
     assert summary.category_counts["analysis"] == 2
+    assert summary.category_counts["intelligence"] == 8
+
+
+def test_task_family_handoff_prefers_browser_path_for_blocked_http() -> None:
+    handoff = task_family_handoff(
+        task_family="web_retrieval",
+        current_tool="http_fetch",
+        outcome="blocked_access",
+        available_tools=("browser_fetch", "web_retrieve", "nexus_tool_registry"),
+    )
+
+    assert handoff is not None
+    assert handoff["recommended_tool"] == "browser_fetch"
+    assert handoff["terminal"] is False
+    assert handoff["next_tools"][0]["tool"] == "browser_fetch"
+    assert handoff["next_tools"][0]["available"] is True
+
+
+def test_task_family_handoff_uses_registry_when_tool_surface_is_unavailable() -> None:
+    handoff = task_family_handoff(
+        task_family="web_retrieval",
+        current_tool="web_page_diagnose",
+        outcome="tool_unavailable",
+        available_tools=("nexus_tool_registry", "http_fetch"),
+    )
+
+    assert handoff is not None
+    assert handoff["recommended_tool"] == "nexus_tool_registry"
+    assert handoff["next_tools"][0]["tool"] == "nexus_tool_registry"
+
+
+def test_task_family_handoff_terminal_outcome_does_not_leak_fallback_tools() -> None:
+    handoff = task_family_handoff(
+        task_family="web_retrieval",
+        current_tool="web_page_diagnose",
+        outcome="blocked_after_browser_attempt",
+        available_tools=("web_retrieve", "browser_fetch", "nexus_tool_registry"),
+    )
+
+    assert handoff is not None
+    assert handoff["terminal"] is True
+    assert handoff["action"] == "report_blocked_access"
+    assert handoff["recommended_tool"] is None
+    assert handoff["next_tools"] == []
 
 
 def test_db_client_defaults_are_minimal_and_deduplicated() -> None:
@@ -170,6 +226,17 @@ def test_stdin_script_command_avoids_external_tempfile_utilities() -> None:
     assert command.startswith("python3 - <<'NEXUS_SCRIPT_EOF'")
     assert "cat >" not in command
     assert "rm -f" not in command
+
+
+def test_stdin_script_argv_command_quotes_arguments() -> None:
+    command = _stdin_script_argv_command(
+        "python3",
+        "print('hello')",
+        stdin_flag="-",
+        args=["/tmp/my script.py", "--label=error case"],
+    )
+
+    assert command.startswith("python3 - '/tmp/my script.py' '--label=error case' <<'NEXUS_SCRIPT_EOF'")
 
 
 def test_argv_command_quotes_arguments() -> None:

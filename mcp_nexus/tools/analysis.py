@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 
+from mcp_nexus.python_execution import numeric_thread_env, write_secret_file
 from mcp_nexus.python_sandbox import ensure_python_sandbox, sandbox_path
 from mcp_nexus.results import ToolResult, build_tool_result
 from mcp_nexus.runtime import ExecutionLimits, ExecutionRequest, build_managed_command, extract_execution_metadata
@@ -19,7 +20,6 @@ from mcp_nexus.transport.ssh import CommandResult
 
 TABULAR_ANALYSIS_REQUIREMENTS = ("numpy", "pandas", "scikit-learn", "psycopg[binary]")
 TABULAR_ANALYSIS_SANDBOX = "tabular-analysis"
-TABULAR_DB_ENV = "NEXUS_ANALYSIS_DB_URI"
 
 
 def _result(
@@ -109,6 +109,7 @@ async def _run_analysis_job(
     conn = await pool.acquire()
     script_path = f"/tmp/{tool_name}-{uuid4().hex}.py"
     payload_path = f"/tmp/{tool_name}-{uuid4().hex}.json"
+    db_uri_path = ""
     try:
         capabilities = await conn.probe_capabilities()
         if not capabilities.python_command:
@@ -116,10 +117,20 @@ async def _run_analysis_job(
 
         python_bin = str(sandbox_info["python"])
         runtime_payload = dict(payload)
-        runtime_env = {"VIRTUAL_ENV": str(sandbox_info["path"]), "PATH": f"{sandbox_info['path']}/bin:$PATH"}
+        thread_limit = max(1, get_settings().analysis_thread_limit)
+        runtime_env = {
+            "VIRTUAL_ENV": str(sandbox_info["path"]),
+            "PATH": f"{sandbox_info['path']}/bin:$PATH",
+            **numeric_thread_env(thread_limit),
+        }
         db_uri = str(runtime_payload.pop("db_uri", "") or "")
         if db_uri:
-            runtime_env[str(runtime_payload["db_env_var"])] = db_uri
+            db_uri_path = await write_secret_file(conn, prefix=f"{tool_name}-db", content=db_uri)
+            runtime_payload["db_uri_path"] = db_uri_path
+        runtime_payload["execution_policy"] = {
+            "numeric_thread_limit": thread_limit,
+            "database_delivery": "secret_file" if db_uri_path else None,
+        }
         await conn.write_file(script_path, _analysis_script())
         await conn.write_file(payload_path, json.dumps(runtime_payload, ensure_ascii=True))
 
@@ -142,7 +153,11 @@ async def _run_analysis_job(
         )
     finally:
         try:
-            await conn.run_full(f"rm -f {shlex.quote(script_path)} {shlex.quote(payload_path)}", timeout=20)
+            cleanup_paths = [script_path, payload_path, *([db_uri_path] if db_uri_path else [])]
+            await conn.run_full(
+                "rm -f " + " ".join(shlex.quote(path) for path in cleanup_paths),
+                timeout=20,
+            )
         finally:
             pool.release(conn)
 
@@ -174,13 +189,27 @@ def _load_payload() -> dict:
     return json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 
 
-def _load_frame(spec: dict, db_env_var: str) -> pd.DataFrame:
+def _load_db_uri(spec: dict) -> str:
+    db_uri_path = str(spec.get("db_uri_path") or "")
+    if not db_uri_path:
+        raise ValueError("db_uri_path is required for SQL sources")
+    path = Path(db_uri_path)
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _load_frame(spec: dict) -> pd.DataFrame:
     if spec["kind"] == "csv":
         return pd.read_csv(spec["csv_path"])
 
     import psycopg
 
-    uri = os.environ[db_env_var]
+    uri = _load_db_uri(spec)
     with psycopg.connect(uri) as conn:
         return pd.read_sql_query(spec["query"], conn)
 
@@ -258,6 +287,7 @@ def _profile_dataset(payload: dict, frame: pd.DataFrame) -> dict:
         "rows": int(len(frame)),
         "columns": int(len(frame.columns)),
         "target_column": target_column or None,
+        "execution_policy": payload.get("execution_policy") or {},
         "numeric_columns": numeric_columns,
         "datetime_columns": datetime_columns,
         "text_columns": text_columns,
@@ -456,6 +486,7 @@ def _train_classifier(payload: dict, frame: pd.DataFrame) -> dict:
             "class_weight": "balanced",
             "max_iter": int(payload.get("max_iter") or 1000),
         },
+        "execution_policy": payload.get("execution_policy") or {},
         "baseline": baseline,
         "metrics": metrics,
         "top_feature_weights": feature_weights,
@@ -474,7 +505,7 @@ def _train_classifier(payload: dict, frame: pd.DataFrame) -> dict:
 
 def main() -> None:
     payload = _load_payload()
-    frame = _load_frame(payload["source"], payload["db_env_var"])
+    frame = _load_frame(payload["source"])
     if payload["mode"] == "profile":
         report = _profile_dataset(payload, frame)
     elif payload["mode"] == "train_classifier":
@@ -523,7 +554,6 @@ def register(mcp: FastMCP):
             "target_column": target_column.strip(),
             "sample_rows": max(1, min(sample_rows, 20)),
             "datetime_threshold": max(0.5, min(datetime_threshold, 1.0)),
-            "db_env_var": TABULAR_DB_ENV,
         }
         if source["kind"] == "sql":
             try:
@@ -644,7 +674,6 @@ def register(mcp: FastMCP):
             "max_text_features": max(128, min(max_text_features, 10000)),
             "top_features": max(1, min(top_features, 100)),
             "datetime_threshold": max(0.5, min(datetime_threshold, 1.0)),
-            "db_env_var": TABULAR_DB_ENV,
         }
         if source["kind"] == "sql":
             try:

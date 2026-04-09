@@ -12,6 +12,7 @@ def test_default_settings():
     assert s.port == 8766 or isinstance(s.port, int)
     assert s.mcp_path.startswith("/mcp")
     assert s.ssh_port == 22 or isinstance(s.ssh_port, int)
+    assert s.analysis_thread_limit >= 1
 
 
 def test_localhost_detection():
@@ -200,3 +201,11 @@ def test_transport_security_derives_public_hosts_and_redirect_origins() -> None:
     assert "lightcap.ai:*" in settings.transport_allowed_hosts
     assert "https://lightcap.ai" in settings.transport_allowed_origins
     assert "https://chatgpt.com" in settings.transport_allowed_origins
+
+
+def test_analysis_thread_limit_reads_environment(monkeypatch) -> None:
+    monkeypatch.setenv("NEXUS_ANALYSIS_THREAD_LIMIT", "3")
+
+    settings = Settings()
+
+    assert settings.analysis_thread_limit == 3

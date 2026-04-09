@@ -86,6 +86,23 @@ class ArtifactManager:
         path.write_text(content, encoding="utf-8")
         return ArtifactRef(path=str(path), kind=channel, size_bytes=path.stat().st_size)
 
+    def write_bytes(
+        self,
+        *,
+        tool_name: str,
+        channel: str,
+        content: bytes,
+        request_id: str,
+        suffix: str,
+    ) -> ArtifactRef:
+        safe_tool = tool_name.replace("/", "_")
+        target_dir = self.root / safe_tool / request_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{channel}-{int(time.time() * 1000)}-{uuid4().hex[:8]}{suffix}"
+        path = target_dir / filename
+        path.write_bytes(content)
+        return ArtifactRef(path=str(path), kind=channel, size_bytes=path.stat().st_size)
+
 
 def preview_text(text: str, limit: int) -> str | None:
     if not text:
